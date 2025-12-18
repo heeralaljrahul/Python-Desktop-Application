@@ -9,9 +9,17 @@ import sqlite3
 import calendar
 import logging
 import weakref
+import io
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple, Any
 from functools import lru_cache
+
+# Chart libraries
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
+import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 
 from PIL import Image, ImageDraw
 from reportlab.lib import colors
@@ -1479,23 +1487,35 @@ class RenusApp(ctk.CTk):
         order_code = db.ensure_row_code("orders", "order_code", "ORD-", oid)
 
         t = ctk.CTkToplevel(self)
-        t.geometry("640x640")
+        t.geometry("680x700")
         t.title(f"Edit Order {order_code}")
         t.grab_set()
 
+        # Store original quantities for inventory adjustment
         self.edit_cart: Dict[int, Dict] = {}
+        self.original_cart: Dict[int, int] = {}  # item_id -> original_qty
         existing = db.fetch(
             "SELECT oi.item_id, i.name, i.price, oi.quantity FROM order_items oi JOIN items i ON oi.item_id = i.id WHERE oi.order_id=?",
             (oid,),
         )
         for iid, name, price, qty in existing:
             self.edit_cart[iid] = {"name": name, "price": price, "qty": qty}
+            self.original_cart[iid] = qty
 
         ctk.CTkLabel(t, text=f"Editing {order_code}\nInternal ID: {oid}", font=("Arial", 20, "bold")).pack(pady=10)
+
+        # Info label about inventory
+        ctk.CTkLabel(
+            t,
+            text="Note: Inventory will be automatically adjusted when you save changes",
+            font=("Arial", 11),
+            text_color="gray"
+        ).pack(pady=(0, 10))
+
         add_f = ctk.CTkFrame(t)
         add_f.pack(fill="x", padx=20, pady=10)
-        all_items = db.fetch("SELECT id, name, price FROM items")
-        item_map = {f"{i['name']} ({currency(i['price'])})": i for i in all_items}
+        all_items = db.fetch("SELECT id, name, price, stock FROM items")
+        item_map = {f"{i['name']} ({currency(i['price'])}) - Stock: {i['stock']}": i for i in all_items}
         if item_map:
             sel_var = ctk.StringVar(value=list(item_map.keys())[0])
             ctk.CTkOptionMenu(add_f, variable=sel_var, values=list(item_map.keys())).pack(
@@ -1512,10 +1532,25 @@ class RenusApp(ctk.CTk):
                 messagebox.showerror("No Items", "Create menu items before editing orders.")
                 return
             raw = item_map[sel_var.get()]
-            if raw["id"] in self.edit_cart:
-                self.edit_cart[raw["id"]]["qty"] += 1
+            item_id = raw["id"]
+            current_stock = raw["stock"]
+
+            # Calculate available stock (current stock + what was originally ordered)
+            original_qty = self.original_cart.get(item_id, 0)
+            current_edit_qty = self.edit_cart.get(item_id, {}).get("qty", 0)
+            available = current_stock + original_qty
+
+            if current_edit_qty >= available:
+                messagebox.showwarning(
+                    "Stock Limit",
+                    f"Cannot add more '{raw['name']}'. Only {available} available (including already ordered)."
+                )
+                return
+
+            if item_id in self.edit_cart:
+                self.edit_cart[item_id]["qty"] += 1
             else:
-                self.edit_cart[raw["id"]] = {"name": raw["name"], "price": raw["price"], "qty": 1}
+                self.edit_cart[item_id] = {"name": raw["name"], "price": raw["price"], "qty": 1}
             refresh_list()
 
         ctk.CTkButton(
@@ -1523,7 +1558,7 @@ class RenusApp(ctk.CTk):
             text="Add Item",
             width=90,
             command=add_new,
-            fg_color=THEME_COLOR,
+            fg_color=Theme.PRIMARY,
             state="normal" if item_map else "disabled",
         ).pack(side="right", padx=10)
 
@@ -1531,6 +1566,17 @@ class RenusApp(ctk.CTk):
         list_f.pack(fill="both", expand=True, padx=20, pady=10)
 
         def change_qty(iid: int, delta: int) -> None:
+            if delta > 0:
+                # Check stock when increasing
+                current_stock = db.get_item_stock(iid) or 0
+                original_qty = self.original_cart.get(iid, 0)
+                current_edit_qty = self.edit_cart[iid]["qty"]
+                available = current_stock + original_qty
+
+                if current_edit_qty >= available:
+                    messagebox.showwarning("Stock Limit", f"No more stock available for this item.")
+                    return
+
             self.edit_cart[iid]["qty"] += delta
             if self.edit_cart[iid]["qty"] <= 0:
                 del self.edit_cart[iid]
@@ -1543,15 +1589,52 @@ class RenusApp(ctk.CTk):
             for iid, data in self.edit_cart.items():
                 sub = data["qty"] * data["price"]
                 grand += sub
-                row = ctk.CTkFrame(list_f, fg_color=("gray90", "#333"))
+
+                # Calculate change from original
+                original_qty = self.original_cart.get(iid, 0)
+                diff = data["qty"] - original_qty
+                diff_text = ""
+                diff_color = "gray"
+                if diff > 0:
+                    diff_text = f" (+{diff})"
+                    diff_color = Theme.WARNING
+                elif diff < 0:
+                    diff_text = f" ({diff})"
+                    diff_color = Theme.SUCCESS  # Returning to inventory
+
+                row = ctk.CTkFrame(list_f, fg_color=Theme.CARD_BG)
                 row.pack(fill="x", pady=2)
-                ctk.CTkLabel(row, text=data["name"], anchor="w", width=240).pack(side="left", padx=10)
+                ctk.CTkLabel(row, text=data["name"], anchor="w", width=200).pack(side="left", padx=10)
                 ctk.CTkLabel(row, text=currency(data["price"]), width=80).pack(side="left")
+
+                # Show quantity with change indicator
+                qty_frame = ctk.CTkFrame(row, fg_color="transparent")
+                qty_frame.pack(side="left", padx=5)
+                ctk.CTkLabel(qty_frame, text=str(data["qty"]), width=30).pack(side="left")
+                if diff_text:
+                    ctk.CTkLabel(qty_frame, text=diff_text, text_color=diff_color, font=("Arial", 10)).pack(side="left")
+
                 ctrl = ctk.CTkFrame(row, fg_color="transparent")
                 ctrl.pack(side="right", padx=10)
                 ctk.CTkButton(ctrl, text="-", width=30, command=lambda x=iid: change_qty(x, -1)).pack(side="left")
-                ctk.CTkLabel(ctrl, text=str(data["qty"]), width=30).pack(side="left")
                 ctk.CTkButton(ctrl, text="+", width=30, command=lambda x=iid: change_qty(x, 1)).pack(side="left")
+
+            # Show items being returned to inventory
+            returned_items = []
+            for iid, orig_qty in self.original_cart.items():
+                if iid not in self.edit_cart:
+                    item_name = db.fetch("SELECT name FROM items WHERE id=?", (iid,))
+                    if item_name:
+                        returned_items.append(f"{item_name[0][0]} x{orig_qty}")
+
+            if returned_items:
+                ctk.CTkLabel(
+                    list_f,
+                    text=f"Returning to inventory: {', '.join(returned_items)}",
+                    text_color=Theme.SUCCESS,
+                    font=("Arial", 11)
+                ).pack(pady=5)
+
             lbl_total.configure(text=f"New Total: {currency(grand)}")
 
         lbl_total = ctk.CTkLabel(t, text="New Total: R 0.00", font=("Arial", 18, "bold"))
@@ -1561,31 +1644,56 @@ class RenusApp(ctk.CTk):
             if not self.edit_cart:
                 messagebox.showerror("Validation", "An order must have at least one item.")
                 return
-            total = sum(d["qty"] * d["price"] for d in self.edit_cart.values())
-            db.execute("DELETE FROM order_items WHERE order_id=?", (oid,))
-            for iid, data in self.edit_cart.items():
-                db.execute(
-                    "INSERT INTO order_items (order_id, item_id, quantity, subtotal) VALUES (?, ?, ?, ?)",
-                    (oid, iid, data["qty"], data["qty"] * data["price"]),
-                )
-            db.execute("UPDATE orders SET total=?, status=? WHERE id=?", (total, "Preparing", oid))
-            messagebox.showinfo("Saved", f"Order {order_code} updated and moved to Preparing")
-            t.destroy()
-            self.refresh_order_list()
 
-        ctk.CTkButton(t, text="SAVE CHANGES", fg_color=THEME_COLOR, height=44, command=save_changes).pack(
+            try:
+                # Calculate inventory adjustments
+                for iid, orig_qty in self.original_cart.items():
+                    new_qty = self.edit_cart.get(iid, {}).get("qty", 0)
+                    diff = orig_qty - new_qty  # Positive = return to stock, Negative = take from stock
+
+                    if diff != 0:
+                        db.execute("UPDATE items SET stock = stock + ? WHERE id = ?", (diff, iid))
+                        logger.info(f"Order {oid} edit: Item {iid} stock adjusted by {diff}")
+
+                # Handle new items not in original order
+                for iid, data in self.edit_cart.items():
+                    if iid not in self.original_cart:
+                        # New item added - deduct from stock
+                        db.execute("UPDATE items SET stock = stock - ? WHERE id = ?", (data["qty"], iid))
+                        logger.info(f"Order {oid} edit: New item {iid} deducted {data['qty']} from stock")
+
+                total = sum(d["qty"] * d["price"] for d in self.edit_cart.values())
+                db.execute("DELETE FROM order_items WHERE order_id=?", (oid,))
+                for iid, data in self.edit_cart.items():
+                    db.execute(
+                        "INSERT INTO order_items (order_id, item_id, quantity, subtotal) VALUES (?, ?, ?, ?)",
+                        (oid, iid, data["qty"], data["qty"] * data["price"]),
+                    )
+                db.execute("UPDATE orders SET total=?, status=? WHERE id=?", (total, "Preparing", oid))
+                messagebox.showinfo("Saved", f"Order {order_code} updated and inventory adjusted")
+                t.destroy()
+                self.refresh_order_list()
+
+            except sqlite3.Error as e:
+                logger.error(f"Failed to update order {oid}: {e}")
+                messagebox.showerror("Error", "Failed to save changes. Please try again.")
+
+        ctk.CTkButton(t, text="SAVE CHANGES", fg_color=Theme.PRIMARY, height=44, command=save_changes).pack(
             fill="x", padx=20, pady=16
         )
         refresh_list()
 
     def gen_pdf(self, oid: Optional[int]) -> None:
+        """Generate a professional formal invoice PDF"""
         if not oid:
             return
-        file = filedialog.asksaveasfilename(defaultextension=".pdf", initialfile=f"Invoice_Order_{oid}.pdf")
+        file = filedialog.asksaveasfilename(defaultextension=".pdf", initialfile=f"Invoice_{oid}.pdf")
         if not file:
             return
+
         data = db.fetch(
-            "SELECT o.id, o.order_code, c.name, o.date, o.total, c.address, c.city, c.email, o.status FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.id=?",
+            """SELECT o.id, o.order_code, c.name, o.date, o.total, c.address, c.city, c.email, c.phone, o.status
+               FROM orders o JOIN customers c ON o.customer_id = c.id WHERE o.id=?""",
             (oid,),
         )[0]
         order_code = data["order_code"] or db.ensure_row_code("orders", "order_code", "ORD-", oid)
@@ -1594,53 +1702,179 @@ class RenusApp(ctk.CTk):
             (oid,),
         )
 
-        c = canvas.Canvas(file, pagesize=letter)
-        c.setFillColor(colors.HexColor(THEME_COLOR))
-        c.rect(0, 742, 612, 100, fill=True, stroke=False)
+        c = canvas.Canvas(file, pagesize=A4)
+        width, height = A4
+
+        # ===== HEADER SECTION =====
+        # Company logo area (green banner)
+        c.setFillColor(colors.HexColor(Theme.PRIMARY))
+        c.rect(0, height - 100, width, 100, fill=True, stroke=False)
+
+        # Company name and details
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 22)
-        c.drawString(40, 800, APP_NAME)
-        c.setFont("Helvetica", 12)
-        c.drawString(40, 780, APP_LOCATION)
-        c.drawString(40, 762, APP_TAGLINE)
-
-        c.setFillColor(colors.black)
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(40, 730, f"Invoice {order_code} (ID {data['id']})")
-        c.setFont("Helvetica", 12)
-        c.drawString(40, 712, f"Customer: {data['name']}")
-        c.drawString(40, 694, f"Email: {data['email']}")
-        c.drawString(40, 676, f"Address: {data['address'] or 'Not provided'}, {data['city'] or ''}")
-        c.drawString(40, 658, f"Date: {data['date']}")
-        c.drawString(40, 640, f"Status: {db.normalize_status(data['status'])}")
-
-        y = 610
-        c.setFont("Helvetica-Bold", 12)
-        c.drawString(40, y, "Item")
-        c.drawString(300, y, "Qty")
-        c.drawString(360, y, "Price")
-        c.drawString(460, y, "Total")
-        c.line(40, y - 5, 540, y - 5)
-        y -= 20
+        c.setFont("Helvetica-Bold", 28)
+        c.drawString(25 * mm, height - 35, APP_NAME)
         c.setFont("Helvetica", 11)
-        for name, qty, price, sub in items:
-            c.drawString(40, y, name[:35])
-            c.drawString(300, y, str(qty))
-            c.drawString(360, y, currency(price))
-            c.drawString(460, y, currency(sub))
-            y -= 18
-            if y < 120:
-                c.showPage()
-                y = 700
-        c.line(40, y - 5, 540, y - 5)
-        c.setFont("Helvetica-Bold", 14)
-        c.drawString(360, y - 24, "Grand Total:")
-        c.drawString(460, y - 24, currency(data["total"]))
+        c.drawString(25 * mm, height - 50, APP_TAGLINE)
+        c.drawString(25 * mm, height - 65, f"{APP_LOCATION}")
+        c.drawString(25 * mm, height - 80, "Tel: +27 12 XXX XXXX  |  Email: info@renusdelights.co.za")
+
+        # INVOICE title on the right
+        c.setFont("Helvetica-Bold", 32)
+        c.drawRightString(width - 25 * mm, height - 45, "INVOICE")
         c.setFont("Helvetica", 12)
-        c.drawString(40, y - 48, "Thank you for your order!")
-        c.drawString(40, y - 64, "For any issues or queries, email renusdelights@gmail.com")
+        c.drawRightString(width - 25 * mm, height - 62, f"#{order_code}")
+
+        # ===== INVOICE DETAILS BOX =====
+        y = height - 130
+
+        # Invoice info box (right side)
+        c.setFillColor(colors.HexColor("#f8f8f8"))
+        c.roundRect(width - 85 * mm, y - 55, 70 * mm, 60, 3, fill=True, stroke=False)
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(width - 82 * mm, y - 8, "Invoice Number:")
+        c.drawString(width - 82 * mm, y - 22, "Invoice Date:")
+        c.drawString(width - 82 * mm, y - 36, "Due Date:")
+        c.drawString(width - 82 * mm, y - 50, "Status:")
+
+        c.setFont("Helvetica", 10)
+        c.drawRightString(width - 18 * mm, y - 8, order_code)
+        invoice_date = datetime.strptime(data['date'], "%Y-%m-%d %H:%M:%S") if data['date'] else datetime.now()
+        c.drawRightString(width - 18 * mm, y - 22, invoice_date.strftime("%d %B %Y"))
+        c.drawRightString(width - 18 * mm, y - 36, "Due on Receipt")
+        status = db.normalize_status(data['status'])
+        status_color = Theme.STATUS_COLORS.get(status, Theme.MUTED)
+        c.setFillColor(colors.HexColor(status_color))
+        c.drawRightString(width - 18 * mm, y - 50, status)
+
+        # ===== BILL TO SECTION =====
+        c.setFillColor(colors.HexColor(Theme.PRIMARY))
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(25 * mm, y, "BILL TO:")
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(25 * mm, y - 15, data['name'])
+        c.setFont("Helvetica", 10)
+        y_bill = y - 28
+        if data['email']:
+            c.drawString(25 * mm, y_bill, data['email'])
+            y_bill -= 12
+        if data.get('phone'):
+            c.drawString(25 * mm, y_bill, data['phone'])
+            y_bill -= 12
+        if data['address'] or data['city']:
+            address_line = f"{data['address'] or ''}"
+            if data['city']:
+                address_line += f", {data['city']}"
+            c.drawString(25 * mm, y_bill, address_line.strip(", "))
+
+        # ===== ITEMS TABLE =====
+        y = height - 220
+
+        # Table header
+        c.setFillColor(colors.HexColor(Theme.PRIMARY))
+        c.rect(20 * mm, y - 5, width - 40 * mm, 20, fill=True, stroke=False)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 10)
+        c.drawString(25 * mm, y + 2, "DESCRIPTION")
+        c.drawString(105 * mm, y + 2, "QTY")
+        c.drawString(125 * mm, y + 2, "UNIT PRICE")
+        c.drawRightString(width - 25 * mm, y + 2, "AMOUNT")
+
+        y -= 22
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica", 10)
+
+        subtotal = 0
+        row_alt = False
+        for name, qty, price, sub in items:
+            # Alternating row background
+            if row_alt:
+                c.setFillColor(colors.HexColor("#f9f9f9"))
+                c.rect(20 * mm, y - 3, width - 40 * mm, 16, fill=True, stroke=False)
+            row_alt = not row_alt
+
+            c.setFillColor(colors.black)
+            c.drawString(25 * mm, y, name[:45])
+            c.drawString(108 * mm, y, str(qty))
+            c.drawString(125 * mm, y, currency(price))
+            c.drawRightString(width - 25 * mm, y, currency(sub))
+            subtotal += sub
+            y -= 18
+
+            if y < 80 * mm:
+                c.showPage()
+                y = height - 50 * mm
+
+        # Table bottom line
+        c.setStrokeColor(colors.HexColor("#cccccc"))
+        c.line(20 * mm, y + 5, width - 20 * mm, y + 5)
+
+        # ===== TOTALS SECTION =====
+        y -= 15
+
+        # Subtotal
+        c.setFont("Helvetica", 11)
+        c.drawString(125 * mm, y, "Subtotal:")
+        c.drawRightString(width - 25 * mm, y, currency(subtotal))
+        y -= 16
+
+        # VAT (15% for South Africa)
+        vat = subtotal * 0.15
+        c.drawString(125 * mm, y, "VAT (15%):")
+        c.drawRightString(width - 25 * mm, y, currency(vat))
+        y -= 20
+
+        # Grand Total box
+        c.setFillColor(colors.HexColor(Theme.PRIMARY))
+        c.roundRect(120 * mm, y - 8, width - 145 * mm, 25, 3, fill=True, stroke=False)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(125 * mm, y, "TOTAL DUE:")
+        c.setFont("Helvetica-Bold", 14)
+        c.drawRightString(width - 25 * mm, y, currency(data["total"]))
+
+        # ===== PAYMENT DETAILS =====
+        y -= 50
+        c.setFillColor(colors.black)
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(25 * mm, y, "PAYMENT INFORMATION")
+        y -= 15
+        c.setFont("Helvetica", 10)
+        c.drawString(25 * mm, y, "Bank: First National Bank (FNB)")
+        y -= 12
+        c.drawString(25 * mm, y, "Account Name: Renus Authentic Delights")
+        y -= 12
+        c.drawString(25 * mm, y, "Account Number: XXXX XXXX XXXX")
+        y -= 12
+        c.drawString(25 * mm, y, "Branch Code: 250655")
+        y -= 12
+        c.drawString(25 * mm, y, f"Reference: {order_code}")
+
+        # ===== TERMS & NOTES =====
+        y -= 30
+        c.setFont("Helvetica-Bold", 11)
+        c.drawString(25 * mm, y, "TERMS & CONDITIONS")
+        y -= 15
+        c.setFont("Helvetica", 9)
+        c.setFillColor(colors.HexColor("#666666"))
+        c.drawString(25 * mm, y, "1. Payment is due upon receipt of this invoice.")
+        y -= 11
+        c.drawString(25 * mm, y, "2. Please use the invoice number as payment reference.")
+        y -= 11
+        c.drawString(25 * mm, y, "3. For queries, contact us at info@renusdelights.co.za or +27 12 XXX XXXX")
+
+        # ===== FOOTER =====
+        c.setFillColor(colors.HexColor(Theme.PRIMARY))
+        c.rect(0, 0, width, 25, fill=True, stroke=False)
+        c.setFillColor(colors.white)
+        c.setFont("Helvetica", 9)
+        c.drawCentredString(width / 2, 10, "Thank you for your business!  |  www.renusdelights.co.za  |  Pretoria, South Africa")
+
         c.save()
-        messagebox.showinfo("Saved", "Invoice PDF generated")
+        logger.info(f"Invoice generated for order {oid}: {file}")
+        messagebox.showinfo("Invoice Generated", f"Professional invoice saved to:\n{file}")
 
     # ---------- ITEMS ----------
     def show_menu(self) -> None:
@@ -1695,8 +1929,8 @@ class RenusApp(ctk.CTk):
         cat = self.item_category_var.get()
         keyword = self.item_search_var.get().strip().lower()
 
-        # SQL-based filtering for better performance
-        query = "SELECT id, name, category, price, stock, item_code FROM items WHERE 1=1"
+        # SQL-based filtering for better performance (include image_path)
+        query = "SELECT id, name, category, price, stock, item_code, image_path FROM items WHERE 1=1"
         params: List = []
         if cat != "All":
             query += " AND category = ?"
@@ -1715,15 +1949,44 @@ class RenusApp(ctk.CTk):
         for r in items:
             code = r["item_code"] or db.generate_code("ITM-", r["id"])
             card = ctk.CTkFrame(self.item_list_frame, fg_color=Theme.CARD_BG, corner_radius=Theme.CARD_RADIUS)
-            card.pack(fill="x", pady=5, padx=5)
+            card.pack(fill="x", pady=6, padx=5)
+
+            # Display image if available
+            image_path = r["image_path"]
+            if image_path:
+                img = ImageCache.get(image_path, (60, 60))
+                if img:
+                    ctk.CTkLabel(card, text="", image=img).pack(side="left", padx=(15, 10), pady=10)
+
+            # Item info frame
+            info_frame = ctk.CTkFrame(card, fg_color="transparent")
+            info_frame.pack(side="left", padx=10, pady=10, fill="y")
+
+            ctk.CTkLabel(
+                info_frame,
+                text=r['name'],
+                font=("Arial", Theme.FONT_LG, "bold"),
+                anchor="w"
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                info_frame,
+                text=f"{code} (ID {r['id']})",
+                font=("Arial", Theme.FONT_SM),
+                text_color="gray",
+                anchor="w"
+            ).pack(anchor="w")
+
+            # Category badge
+            cat_color = Theme.INFO if r["category"] == "Menu" else (Theme.WARNING if r["category"] == "Spice" else Theme.MUTED)
             ctk.CTkLabel(
                 card,
-                text=f"{r['name']}\n{code} (ID {r['id']})",
-                font=("Arial", Theme.FONT_LG, "bold"),
-                width=250,
-                anchor="w"
-            ).pack(side="left", padx=20, pady=15)
-            ctk.CTkLabel(card, text=r["category"], width=100, anchor="w").pack(side="left", padx=10)
+                text=r["category"],
+                width=80,
+                fg_color=cat_color,
+                corner_radius=4,
+                text_color="white"
+            ).pack(side="left", padx=10)
+
             ctk.CTkLabel(
                 card,
                 text=currency(r["price"]),
@@ -1735,7 +1998,8 @@ class RenusApp(ctk.CTk):
             # Color-coded stock display
             stock = r['stock']
             stock_color = Theme.MUTED if stock > 10 else (Theme.WARNING if stock > 0 else Theme.ERROR)
-            ctk.CTkLabel(card, text=f"Stock: {stock}", text_color=stock_color).pack(side="left", padx=10)
+            stock_text = f"Stock: {stock}" if stock > 0 else "Out of Stock"
+            ctk.CTkLabel(card, text=stock_text, text_color=stock_color).pack(side="left", padx=10)
 
             ctk.CTkButton(
                 card,
@@ -2368,30 +2632,47 @@ class RenusApp(ctk.CTk):
         if month_val != "All":
             month_num = datetime.strptime(month_val, "%B").month
         report = db.monthly_report(year_val, month_num)
+
+        # Summary cards
         cards = ctk.CTkFrame(self.report_body, fg_color="transparent")
         cards.pack(fill="x", pady=8)
-        for title, value in [
-            ("Revenue", currency(report["total_revenue"])),
-            ("Orders", str(len(report["orders"]))),
-            ("Completed", str(report["status_counts"].get("Completed", 0))),
+        for title, value, color in [
+            ("Revenue", currency(report["total_revenue"]), Theme.PRIMARY),
+            ("Orders", str(len(report["orders"])), Theme.INFO),
+            ("Completed", str(report["status_counts"].get("Completed", 0)), Theme.SUCCESS),
+            ("Pending", str(report["status_counts"].get("Pending", 0)), Theme.WARNING),
         ]:
             card = ctk.CTkFrame(cards, fg_color=("white", "#2b2b2b"), corner_radius=12)
             card.pack(side="left", expand=True, fill="x", padx=6)
             ctk.CTkLabel(card, text=title, font=("Arial", 13), text_color="gray").pack(pady=(12, 2))
-            ctk.CTkLabel(card, text=value, font=("Arial", 20, "bold")).pack(pady=(0, 12))
+            ctk.CTkLabel(card, text=value, font=("Arial", 20, "bold"), text_color=color).pack(pady=(0, 12))
 
+        # Charts section
+        charts_frame = ctk.CTkFrame(self.report_body, fg_color="transparent")
+        charts_frame.pack(fill="x", pady=10)
+        charts_frame.grid_columnconfigure(0, weight=1)
+        charts_frame.grid_columnconfigure(1, weight=1)
+
+        # Create charts if there's data
+        if report["orders"] or report["top_items"]:
+            self._create_status_pie_chart(charts_frame, report, 0)
+            self._create_top_items_bar_chart(charts_frame, report, 1)
+
+        # Top Items list
         detail = ctk.CTkFrame(self.report_body, fg_color=("white", "#2b2b2b"), corner_radius=12)
         detail.pack(fill="both", expand=True, pady=10)
-        ctk.CTkLabel(detail, text="Top Items", font=("Arial", 15, "bold")).pack(anchor="w", padx=14, pady=8)
+        ctk.CTkLabel(detail, text="Top Selling Items", font=("Arial", 15, "bold")).pack(anchor="w", padx=14, pady=8)
         if report["top_items"]:
-            for name, qty in report["top_items"]:
+            for idx, (name, qty) in enumerate(report["top_items"], 1):
                 row = ctk.CTkFrame(detail, fg_color="transparent")
                 row.pack(fill="x", padx=14, pady=2)
+                ctk.CTkLabel(row, text=f"{idx}.", font=("Arial", 12, "bold"), width=25).pack(side="left")
                 ctk.CTkLabel(row, text=name, anchor="w").pack(side="left")
-                ctk.CTkLabel(row, text=f"Qty: {qty}", anchor="e").pack(side="right")
+                ctk.CTkLabel(row, text=f"{qty} sold", anchor="e", text_color=Theme.PRIMARY).pack(side="right")
         else:
             ctk.CTkLabel(detail, text="No sales in this period", text_color="gray").pack(pady=10)
 
+        # Status chips
         status_frame = ctk.CTkFrame(self.report_body, fg_color="transparent")
         status_frame.pack(fill="x", pady=6)
         for s in STATUSES:
@@ -2399,9 +2680,105 @@ class RenusApp(ctk.CTk):
             chip = ctk.CTkFrame(status_frame, fg_color=("white", "#2b2b2b"), corner_radius=12)
             chip.pack(side="left", expand=True, fill="x", padx=5)
             ctk.CTkLabel(chip, text=s, font=("Arial", 12, "bold")).pack(pady=(8, 2))
-            ctk.CTkLabel(chip, text=str(val), font=("Arial", 14)).pack(pady=(0, 8))
+            color = Theme.STATUS_COLORS.get(s, Theme.MUTED)
+            ctk.CTkLabel(chip, text=str(val), font=("Arial", 14), text_color=color).pack(pady=(0, 8))
 
         self.current_report = report
+
+    def _create_status_pie_chart(self, parent: ctk.CTkFrame, report: Dict, col: int) -> None:
+        """Create a pie chart showing order status distribution"""
+        chart_frame = ctk.CTkFrame(parent, fg_color=("white", "#2b2b2b"), corner_radius=12)
+        chart_frame.grid(row=0, column=col, padx=6, pady=6, sticky="nsew")
+
+        ctk.CTkLabel(chart_frame, text="Order Status Distribution", font=("Arial", 13, "bold")).pack(pady=(10, 5))
+
+        # Get status data
+        status_data = report["status_counts"]
+        labels = []
+        sizes = []
+        colors_list = []
+
+        for status in STATUSES:
+            count = status_data.get(status, 0)
+            if count > 0:
+                labels.append(status)
+                sizes.append(count)
+                colors_list.append(Theme.STATUS_COLORS.get(status, "#757575"))
+
+        if not sizes:
+            ctk.CTkLabel(chart_frame, text="No data", text_color="gray").pack(pady=20)
+            return
+
+        # Create figure
+        fig = Figure(figsize=(3.5, 2.5), dpi=100)
+        fig.patch.set_facecolor('#2b2b2b' if ctk.get_appearance_mode() == "Dark" else 'white')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#2b2b2b' if ctk.get_appearance_mode() == "Dark" else 'white')
+
+        wedges, texts, autotexts = ax.pie(
+            sizes,
+            labels=labels,
+            colors=colors_list,
+            autopct='%1.0f%%',
+            startangle=90,
+            textprops={'color': 'white' if ctk.get_appearance_mode() == "Dark" else 'black', 'fontsize': 8}
+        )
+        for autotext in autotexts:
+            autotext.set_color('white')
+            autotext.set_fontsize(8)
+
+        ax.axis('equal')
+        fig.tight_layout()
+
+        # Embed in tkinter
+        canvas_widget = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas_widget.draw()
+        canvas_widget.get_tk_widget().pack(pady=5, padx=10)
+
+    def _create_top_items_bar_chart(self, parent: ctk.CTkFrame, report: Dict, col: int) -> None:
+        """Create a bar chart showing top selling items"""
+        chart_frame = ctk.CTkFrame(parent, fg_color=("white", "#2b2b2b"), corner_radius=12)
+        chart_frame.grid(row=0, column=col, padx=6, pady=6, sticky="nsew")
+
+        ctk.CTkLabel(chart_frame, text="Top Selling Items", font=("Arial", 13, "bold")).pack(pady=(10, 5))
+
+        top_items = report.get("top_items", [])
+        if not top_items:
+            ctk.CTkLabel(chart_frame, text="No data", text_color="gray").pack(pady=20)
+            return
+
+        # Prepare data
+        names = [item[0][:15] + "..." if len(item[0]) > 15 else item[0] for item in top_items]
+        quantities = [item[1] for item in top_items]
+
+        # Create figure
+        fig = Figure(figsize=(3.5, 2.5), dpi=100)
+        fig.patch.set_facecolor('#2b2b2b' if ctk.get_appearance_mode() == "Dark" else 'white')
+        ax = fig.add_subplot(111)
+        ax.set_facecolor('#2b2b2b' if ctk.get_appearance_mode() == "Dark" else 'white')
+
+        bars = ax.barh(names, quantities, color=Theme.PRIMARY)
+        ax.invert_yaxis()  # Top item at top
+
+        # Style
+        text_color = 'white' if ctk.get_appearance_mode() == "Dark" else 'black'
+        ax.tick_params(axis='both', colors=text_color, labelsize=8)
+        ax.spines['top'].set_visible(False)
+        ax.spines['right'].set_visible(False)
+        ax.spines['bottom'].set_color(text_color)
+        ax.spines['left'].set_color(text_color)
+
+        # Add value labels
+        for bar, qty in zip(bars, quantities):
+            ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height()/2,
+                   str(qty), va='center', color=text_color, fontsize=8)
+
+        fig.tight_layout()
+
+        # Embed in tkinter
+        canvas_widget = FigureCanvasTkAgg(fig, master=chart_frame)
+        canvas_widget.draw()
+        canvas_widget.get_tk_widget().pack(pady=5, padx=10)
 
     def download_report_pdf(self) -> None:
         report = getattr(self, "current_report", None)
@@ -2413,41 +2790,141 @@ class RenusApp(ctk.CTk):
         file = filedialog.asksaveasfilename(defaultextension=".pdf", initialfile=f"Report_{period.replace(' ', '_')}.pdf")
         if not file:
             return
+
         c = canvas.Canvas(file, pagesize=A4)
         width, height = A4
-        c.setFillColor(colors.HexColor(THEME_COLOR))
-        c.rect(0, height - 70, width, 70, fill=True, stroke=False)
+
+        # Header
+        c.setFillColor(colors.HexColor(Theme.PRIMARY))
+        c.rect(0, height - 80, width, 80, fill=True, stroke=False)
         c.setFillColor(colors.white)
-        c.setFont("Helvetica-Bold", 18)
-        c.drawString(20 * mm, height - 30, f"{APP_NAME} Report")
-        c.setFont("Helvetica", 12)
-        c.drawString(20 * mm, height - 48, f"Period: {period}")
-        c.drawString(120 * mm, height - 48, APP_LOCATION)
+        c.setFont("Helvetica-Bold", 22)
+        c.drawString(20 * mm, height - 35, f"{APP_NAME}")
+        c.setFont("Helvetica", 14)
+        c.drawString(20 * mm, height - 52, "Business Performance Report")
+        c.setFont("Helvetica", 11)
+        c.drawString(20 * mm, height - 68, f"Period: {period}  |  Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+        c.drawString(140 * mm, height - 52, APP_LOCATION)
 
+        y = height - 110
+
+        # Summary Box
+        c.setFillColor(colors.HexColor("#f5f5f5"))
+        c.roundRect(15 * mm, y - 60, width - 30 * mm, 65, 5, fill=True, stroke=False)
         c.setFillColor(colors.black)
-        y = height - 90
         c.setFont("Helvetica-Bold", 14)
-        c.drawString(20 * mm, y, "Summary")
-        y -= 14
-        c.setFont("Helvetica", 12)
-        c.drawString(20 * mm, y, f"Revenue: {currency(report['total_revenue'])}")
-        y -= 16
-        c.drawString(20 * mm, y, f"Orders: {len(report['orders'])}")
-        y -= 16
-        for s in STATUSES:
-            c.drawString(20 * mm, y, f"{s}: {report['status_counts'].get(s, 0)}")
-            y -= 16
+        c.drawString(20 * mm, y, "Executive Summary")
+        y -= 20
 
-        y -= 6
+        c.setFont("Helvetica-Bold", 12)
+        c.setFillColor(colors.HexColor(Theme.PRIMARY))
+        c.drawString(25 * mm, y, f"Total Revenue: {currency(report['total_revenue'])}")
+        c.setFillColor(colors.black)
+        c.drawString(100 * mm, y, f"Total Orders: {len(report['orders'])}")
+        y -= 18
+
+        c.setFont("Helvetica", 11)
+        completed = report['status_counts'].get('Completed', 0)
+        pending = report['status_counts'].get('Pending', 0)
+        c.drawString(25 * mm, y, f"Completed: {completed}  |  Pending: {pending}  |  Preparing: {report['status_counts'].get('Preparing', 0)}  |  Ready: {report['status_counts'].get('Ready', 0)}")
+
+        y -= 50
+
+        # Generate and embed pie chart
+        if any(report["status_counts"].values()):
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(20 * mm, y, "Order Status Distribution")
+            y -= 10
+
+            # Create pie chart
+            fig, ax = plt.subplots(figsize=(3, 3))
+            status_data = report["status_counts"]
+            labels = [s for s in STATUSES if status_data.get(s, 0) > 0]
+            sizes = [status_data.get(s, 0) for s in labels]
+            chart_colors = [Theme.STATUS_COLORS.get(s, "#757575") for s in labels]
+
+            if sizes:
+                ax.pie(sizes, labels=labels, colors=chart_colors, autopct='%1.0f%%', startangle=90)
+                ax.axis('equal')
+
+                # Save to buffer
+                buf = io.BytesIO()
+                fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
+                buf.seek(0)
+                plt.close(fig)
+
+                # Add to PDF
+                from reportlab.lib.utils import ImageReader
+                img = ImageReader(buf)
+                c.drawImage(img, 20 * mm, y - 85 * mm, width=75 * mm, height=75 * mm)
+
+        # Top Items chart on the right
+        if report["top_items"]:
+            c.setFont("Helvetica-Bold", 14)
+            c.drawString(105 * mm, y, "Top Selling Items")
+            y_chart = y - 10
+
+            # Create bar chart
+            fig, ax = plt.subplots(figsize=(3.5, 3))
+            names = [item[0][:12] + "..." if len(item[0]) > 12 else item[0] for item in report["top_items"]]
+            quantities = [item[1] for item in report["top_items"]]
+
+            bars = ax.barh(names, quantities, color=Theme.PRIMARY)
+            ax.invert_yaxis()
+            ax.spines['top'].set_visible(False)
+            ax.spines['right'].set_visible(False)
+            ax.set_xlabel('Quantity Sold')
+
+            for bar, qty in zip(bars, quantities):
+                ax.text(bar.get_width() + 0.3, bar.get_y() + bar.get_height()/2, str(qty), va='center', fontsize=8)
+
+            fig.tight_layout()
+
+            buf = io.BytesIO()
+            fig.savefig(buf, format='png', dpi=100, bbox_inches='tight', facecolor='white')
+            buf.seek(0)
+            plt.close(fig)
+
+            from reportlab.lib.utils import ImageReader
+            img = ImageReader(buf)
+            c.drawImage(img, 100 * mm, y_chart - 85 * mm, width=85 * mm, height=75 * mm)
+
+        y -= 95 * mm
+
+        # Top Items List
         c.setFont("Helvetica-Bold", 14)
-        c.drawString(20 * mm, y, "Top Items")
-        y -= 14
-        c.setFont("Helvetica", 12)
-        for name, qty in report["top_items"] or []:
-            c.drawString(20 * mm, y, f"{name} - {qty} sold")
+        c.setFillColor(colors.black)
+        c.drawString(20 * mm, y, "Detailed Item Performance")
+        y -= 18
+
+        c.setFont("Helvetica-Bold", 10)
+        c.setFillColor(colors.HexColor("#666666"))
+        c.drawString(20 * mm, y, "Rank")
+        c.drawString(35 * mm, y, "Item Name")
+        c.drawString(120 * mm, y, "Quantity Sold")
+        y -= 5
+        c.line(20 * mm, y, 180 * mm, y)
+        y -= 12
+
+        c.setFont("Helvetica", 10)
+        c.setFillColor(colors.black)
+        for idx, (name, qty) in enumerate(report["top_items"] or [], 1):
+            c.drawString(23 * mm, y, f"#{idx}")
+            c.drawString(35 * mm, y, name[:40])
+            c.drawString(125 * mm, y, str(qty))
             y -= 14
+            if y < 30 * mm:
+                c.showPage()
+                y = height - 30 * mm
+
+        # Footer
+        c.setFont("Helvetica", 9)
+        c.setFillColor(colors.HexColor("#999999"))
+        c.drawString(20 * mm, 15 * mm, f"Report generated by {APP_NAME} | {APP_LOCATION}")
+        c.drawString(150 * mm, 15 * mm, f"Page 1")
+
         c.save()
-        messagebox.showinfo("Saved", "Report PDF generated")
+        messagebox.showinfo("Saved", "Report PDF with charts generated successfully!")
 
 
 if __name__ == "__main__":
