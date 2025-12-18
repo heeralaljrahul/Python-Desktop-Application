@@ -7,8 +7,11 @@ import random
 import re
 import sqlite3
 import calendar
+import logging
+import weakref
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
+from functools import lru_cache
 
 from PIL import Image, ImageDraw
 from reportlab.lib import colors
@@ -16,12 +19,119 @@ from reportlab.lib.pagesizes import A4, letter
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('renus_app.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# ==================== APP CONFIGURATION ====================
 APP_NAME = "RENUS AUTHENTIC DELIGHTS"
 APP_LOCATION = "Pretoria, South Africa"
 APP_TAGLINE = "Gourmet Pretoria curries & spices"
 STATUSES = ["Pending", "Preparing", "Ready", "Completed"]
-THEME_COLOR = "#2CC985"
-ACCENT = "#FBC02D"
+
+# ==================== THEME CONSTANTS ====================
+class Theme:
+    """Centralized theme configuration for consistent styling"""
+    # Primary colors
+    PRIMARY = "#2CC985"
+    ACCENT = "#FBC02D"
+    ERROR = "#E53935"
+    WARNING = "#F57C00"
+    INFO = "#1f6aa5"
+    SUCCESS = "#2CC985"
+    MUTED = "#757575"
+
+    # Status colors
+    STATUS_COLORS = {
+        "Pending": "#F57C00",
+        "Preparing": "#1f6aa5",
+        "Ready": "#2CC985",
+        "Completed": "#757575"
+    }
+
+    # Card colors (light, dark)
+    CARD_BG = ("gray90", "#333")
+    CARD_BG_ALT = ("gray95", "#333")
+    HEADER_BG = ("white", "#1f1f1f")
+    CONTENT_BG = ("gray92", "gray10")
+
+    # Spacing
+    PADDING_SM = 6
+    PADDING_MD = 12
+    PADDING_LG = 20
+
+    # Font sizes
+    FONT_SM = 10
+    FONT_MD = 12
+    FONT_LG = 14
+    FONT_XL = 18
+    FONT_XXL = 26
+
+    # Dimensions
+    SIDEBAR_WIDTH = 230
+    BUTTON_HEIGHT = 42
+    CARD_RADIUS = 8
+
+# Backward compatibility aliases
+THEME_COLOR = Theme.PRIMARY
+ACCENT = Theme.ACCENT
+
+# ==================== IMAGE CACHE ====================
+class ImageCache:
+    """Cache for PIL images to improve performance"""
+    _cache: Dict[str, Any] = {}
+    _max_size = 100
+
+    @classmethod
+    def get(cls, path: str, size: Tuple[int, int] = (70, 70)) -> Optional[ctk.CTkImage]:
+        """Get cached image or load and cache it"""
+        cache_key = f"{path}_{size[0]}x{size[1]}"
+
+        if cache_key in cls._cache:
+            return cls._cache[cache_key]
+
+        try:
+            if not os.path.exists(path):
+                return None
+            pil_img = Image.open(path)
+            ctk_img = ctk.CTkImage(pil_img, size=size)
+
+            # Evict oldest if cache is full
+            if len(cls._cache) >= cls._max_size:
+                oldest_key = next(iter(cls._cache))
+                del cls._cache[oldest_key]
+
+            cls._cache[cache_key] = ctk_img
+            return ctk_img
+        except Exception as e:
+            logger.warning(f"Failed to load image {path}: {e}")
+            return None
+
+    @classmethod
+    def clear(cls) -> None:
+        """Clear the image cache"""
+        cls._cache.clear()
+
+# ==================== DEBOUNCE UTILITY ====================
+class Debouncer:
+    """Debounce utility for search inputs"""
+    def __init__(self, widget: tk.Widget, delay_ms: int = 300):
+        self.widget = widget
+        self.delay_ms = delay_ms
+        self._job_id: Optional[str] = None
+
+    def debounce(self, callback) -> None:
+        """Cancel previous job and schedule new one"""
+        if self._job_id:
+            self.widget.after_cancel(self._job_id)
+        self._job_id = self.widget.after(self.delay_ms, callback)
 
 
 ctk.set_appearance_mode("Dark")
@@ -32,8 +142,109 @@ def currency(val: float) -> str:
     return f"R {val:,.2f}"
 
 
+# ==================== VALIDATION FUNCTIONS ====================
+class Validators:
+    """Centralized validation utilities with error messages"""
+
+    @staticmethod
+    def email(email: str) -> Tuple[bool, str]:
+        """Validate email address"""
+        if not email:
+            return False, "Email is required"
+        email = email.strip()
+        if len(email) > 254:
+            return False, "Email is too long"
+        pattern = r"^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$"
+        if not re.match(pattern, email):
+            return False, "Enter a valid email address"
+        return True, ""
+
+    @staticmethod
+    def phone(phone: str) -> Tuple[bool, str]:
+        """Validate phone number (supports SA formats)"""
+        if not phone:
+            return True, ""  # Phone is optional
+        phone = phone.strip()
+        # Remove spaces and hyphens for validation
+        clean_phone = re.sub(r'[\s-]', '', phone)
+        if not re.match(r'^\+?[0-9]{7,15}$', clean_phone):
+            return False, "Enter a valid phone number (7-15 digits)"
+        return True, ""
+
+    @staticmethod
+    def city(city: str) -> Tuple[bool, str]:
+        """Validate city name"""
+        if not city:
+            return True, ""  # City is optional
+        city = city.strip()
+        if len(city) < 2:
+            return False, "City name is too short"
+        if len(city) > 100:
+            return False, "City name is too long"
+        if not re.match(r"^[A-Za-z][A-Za-z\s\-'.,]*$", city):
+            return False, "City name contains invalid characters"
+        return True, ""
+
+    @staticmethod
+    def name(name: str, field_name: str = "Name") -> Tuple[bool, str]:
+        """Validate a name field"""
+        if not name:
+            return False, f"{field_name} is required"
+        name = name.strip()
+        if len(name) < 2:
+            return False, f"{field_name} is too short"
+        if len(name) > 100:
+            return False, f"{field_name} is too long"
+        return True, ""
+
+    @staticmethod
+    def price(value: str) -> Tuple[bool, str, Optional[float]]:
+        """Validate price value"""
+        if not value:
+            return False, "Price is required", None
+        try:
+            num = float(value)
+            if num < 0:
+                return False, "Price cannot be negative", None
+            if num == 0:
+                return False, "Price must be greater than 0", None
+            if num > 999999:
+                return False, "Price is too high", None
+            return True, "", num
+        except (TypeError, ValueError):
+            return False, "Enter a valid price", None
+
+    @staticmethod
+    def stock(value: str, allow_zero: bool = True) -> Tuple[bool, str, Optional[int]]:
+        """Validate stock quantity"""
+        if not value:
+            return False, "Stock quantity is required", None
+        try:
+            num = int(float(value))
+            if num < 0:
+                return False, "Stock cannot be negative", None
+            if not allow_zero and num == 0:
+                return False, "Stock must be greater than 0", None
+            if num > 999999:
+                return False, "Stock quantity is too high", None
+            return True, "", num
+        except (TypeError, ValueError):
+            return False, "Enter a valid stock number", None
+
+    @staticmethod
+    def quantity(value: int, available_stock: int, item_name: str = "item") -> Tuple[bool, str]:
+        """Validate order quantity against available stock"""
+        if value <= 0:
+            return False, f"Quantity must be at least 1"
+        if value > available_stock:
+            return False, f"Only {available_stock} of '{item_name}' available in stock"
+        return True, ""
+
+
+# Backward compatible functions
 def valid_email(email: str) -> bool:
-    return bool(re.match(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", email))
+    valid, _ = Validators.email(email)
+    return valid
 
 
 def ensure_positive_number(value: str, allow_zero: bool = False) -> Optional[float]:
@@ -49,7 +260,12 @@ def ensure_positive_number(value: str, allow_zero: bool = False) -> Optional[flo
 def validate_numeric_input(action: str, value_if_allowed: str) -> bool:
     if action == "0":
         return True
+    if not value_if_allowed:
+        return True
     try:
+        # Allow partial input like "1." or ".5"
+        if value_if_allowed in (".", "-", "-.", "-."):
+            return True
         float(value_if_allowed)
         return True
     except ValueError:
@@ -59,23 +275,34 @@ def validate_numeric_input(action: str, value_if_allowed: str) -> bool:
 def validate_int_input(action: str, value_if_allowed: str) -> bool:
     if action == "0":
         return True
+    if not value_if_allowed:
+        return True
     return value_if_allowed.isdigit()
 
 
 def validate_city_name(city: str) -> bool:
-    return bool(re.match(r"^[A-Za-z][A-Za-z\s\-'.]*$", city)) if city else True
+    valid, _ = Validators.city(city)
+    return valid
 
 
 def validate_phone(phone: str) -> bool:
-    return bool(re.match(r"^\+?[0-9\s-]{7,16}$", phone)) if phone else True
+    valid, _ = Validators.phone(phone)
+    return valid
 
 
 class DBManager:
     def __init__(self, db_name: str = "renus_system.db"):
-        self.conn = sqlite3.connect(db_name)
-        self.conn.row_factory = sqlite3.Row
-        self.cursor = self.conn.cursor()
-        self.init_db()
+        try:
+            self.conn = sqlite3.connect(db_name, check_same_thread=False)
+            self.conn.row_factory = sqlite3.Row
+            # Enable foreign key constraints
+            self.conn.execute("PRAGMA foreign_keys = ON")
+            self.cursor = self.conn.cursor()
+            self.init_db()
+            logger.info(f"Database initialized: {db_name}")
+        except sqlite3.Error as e:
+            logger.error(f"Database connection error: {e}")
+            raise
 
     def init_db(self) -> None:
         self.cursor.execute(
@@ -334,13 +561,62 @@ class DBManager:
             img.save(ph_path)
 
     def fetch(self, query: str, params: Tuple = ()) -> List[sqlite3.Row]:
-        self.cursor.execute(query, params)
-        return self.cursor.fetchall()
+        try:
+            self.cursor.execute(query, params)
+            return self.cursor.fetchall()
+        except sqlite3.Error as e:
+            logger.error(f"Database fetch error: {e}, Query: {query[:100]}")
+            raise
 
     def execute(self, query: str, params: Tuple = ()) -> int:
-        self.cursor.execute(query, params)
-        self.conn.commit()
-        return self.cursor.lastrowid
+        try:
+            self.cursor.execute(query, params)
+            self.conn.commit()
+            return self.cursor.lastrowid
+        except sqlite3.Error as e:
+            logger.error(f"Database execute error: {e}, Query: {query[:100]}")
+            self.conn.rollback()
+            raise
+
+    def execute_transaction(self, operations: List[Tuple[str, Tuple]]) -> bool:
+        """Execute multiple operations in a single transaction"""
+        try:
+            for query, params in operations:
+                self.cursor.execute(query, params)
+            self.conn.commit()
+            return True
+        except sqlite3.Error as e:
+            logger.error(f"Transaction error: {e}")
+            self.conn.rollback()
+            raise
+
+    def is_email_unique(self, email: str, table: str, exclude_id: Optional[int] = None) -> bool:
+        """Check if email is unique in the specified table"""
+        if table not in ("customers", "users"):
+            raise ValueError(f"Invalid table: {table}")
+        query = f"SELECT id FROM {table} WHERE LOWER(email) = LOWER(?)"
+        params: List = [email]
+        if exclude_id:
+            query += " AND id != ?"
+            params.append(exclude_id)
+        result = self.fetch(query, tuple(params))
+        return len(result) == 0
+
+    def check_stock_availability(self, cart: Dict[int, Dict]) -> List[Tuple[str, int, int]]:
+        """Check stock availability for items in cart. Returns list of (item_name, requested, available) for insufficient stock"""
+        insufficient = []
+        for item_id, data in cart.items():
+            result = self.fetch("SELECT name, stock FROM items WHERE id = ?", (item_id,))
+            if result:
+                name, stock = result[0]["name"], result[0]["stock"]
+                if data["qty"] > stock:
+                    insufficient.append((name, data["qty"], stock))
+        return insufficient
+
+    def get_item_stock(self, item_id: int) -> Optional[int]:
+        """Get current stock for an item"""
+        result = self.fetch("SELECT stock FROM items WHERE id = ?", (item_id,))
+        return result[0]["stock"] if result else None
 
     def status_for_order(self, oid: int) -> str:
         res = self.fetch("SELECT status FROM orders WHERE id=?", (oid,))
@@ -492,14 +768,18 @@ class RenusApp(ctk.CTk):
 
         filter_row = ctk.CTkFrame(menu_frame, fg_color="transparent")
         filter_row.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(filter_row, text="Filter", font=("Arial", 14, "bold")).pack(side="left", padx=8)
+        ctk.CTkLabel(filter_row, text="Filter", font=("Arial", Theme.FONT_LG, "bold")).pack(side="left", padx=8)
         self.cat_var = ctk.StringVar(value="All")
         ctk.CTkOptionMenu(filter_row, variable=self.cat_var, values=["All", "Menu", "Spice", "Snack"], width=120,
                           command=lambda _: self.load_grid(scroll)).pack(side="left", padx=8)
         self.search_var = ctk.StringVar()
         search_entry = ctk.CTkEntry(filter_row, placeholder_text="Search item", textvariable=self.search_var)
         search_entry.pack(side="left", padx=8, fill="x", expand=True)
-        search_entry.bind("<KeyRelease>", lambda _e: self.load_grid(scroll))
+
+        # Debounced search for better performance
+        menu_debouncer = Debouncer(search_entry, 250)
+        search_entry.bind("<KeyRelease>", lambda _e: menu_debouncer.debounce(lambda: self.load_grid(scroll)))
+
         ctk.CTkButton(filter_row, text="✕", width=28, command=lambda: self.clear_menu_filter(scroll)).pack(side="left", padx=4)
 
         scroll = ctk.CTkScrollableFrame(menu_frame)
@@ -597,50 +877,89 @@ class RenusApp(ctk.CTk):
         for w in parent.winfo_children():
             w.destroy()
         cat = self.cat_var.get()
-        keyword = self.search_var.get().lower()
-        q = "SELECT * FROM items"
-        params: Tuple = ()
+        keyword = self.search_var.get().lower().strip()
+
+        # SQL-based filtering for better performance
+        query = "SELECT * FROM items WHERE 1=1"
+        params: List = []
         if cat != "All":
-            q += " WHERE category=?"
-            params = (cat,)
-        items = db.fetch(q, params)
+            query += " AND category = ?"
+            params.append(cat)
+        if keyword:
+            query += " AND (LOWER(name) LIKE ? OR LOWER(item_code) LIKE ?)"
+            params.extend([f"%{keyword}%", f"%{keyword}%"])
+        query += " ORDER BY name"
+
+        items = db.fetch(query, tuple(params))
         max_cols = 2
         for col in range(max_cols):
             parent.grid_columnconfigure(col, weight=1)
+
+        if not items:
+            ctk.CTkLabel(parent, text="No items found matching your criteria.", text_color="gray").grid(
+                row=0, column=0, columnspan=2, pady=20
+            )
+            return
+
         r = c = 0
         for item in items:
-            if keyword and keyword not in item[1].lower():
-                continue
-            card = ctk.CTkFrame(parent, border_width=1, border_color="gray40", corner_radius=10)
+            card = ctk.CTkFrame(parent, border_width=1, border_color="gray40", corner_radius=Theme.CARD_RADIUS)
             card.grid(row=r, column=c, padx=10, pady=8, sticky="ew")
-            try:
-                img = ctk.CTkImage(Image.open(item[5]), size=(70, 70)) if item[5] else None
+
+            # Use image cache for better performance
+            if item[5]:
+                img = ImageCache.get(item[5], (70, 70))
                 if img:
                     ctk.CTkLabel(card, text="", image=img).pack(side="left", padx=10, pady=10)
-            except Exception:
-                pass
+
             info = ctk.CTkFrame(card, fg_color="transparent")
             info.pack(side="left", padx=5)
-            ctk.CTkLabel(info, text=item[1], font=("Arial", 14, "bold"), wraplength=150).pack(anchor="w")
-            ctk.CTkLabel(info, text=currency(item[3]), font=("Arial", 12)).pack(anchor="w")
-            ctk.CTkLabel(info, text=f"Stock: {item[4]}", font=("Arial", 10), text_color="gray").pack(anchor="w")
-            ctk.CTkButton(
+            ctk.CTkLabel(info, text=item[1], font=("Arial", Theme.FONT_LG, "bold"), wraplength=150).pack(anchor="w")
+            ctk.CTkLabel(info, text=currency(item[3]), font=("Arial", Theme.FONT_MD)).pack(anchor="w")
+
+            # Show stock with color coding
+            stock = item[4]
+            stock_color = Theme.MUTED if stock > 10 else (Theme.WARNING if stock > 0 else Theme.ERROR)
+            stock_text = f"Stock: {stock}" if stock > 0 else "Out of Stock"
+            ctk.CTkLabel(info, text=stock_text, font=("Arial", Theme.FONT_SM), text_color=stock_color).pack(anchor="w")
+
+            # Disable add button if out of stock
+            add_btn = ctk.CTkButton(
                 card,
                 text="Add",
                 width=60,
-                fg_color=THEME_COLOR,
+                fg_color=Theme.PRIMARY if stock > 0 else Theme.MUTED,
+                state="normal" if stock > 0 else "disabled",
                 command=lambda x=item: self.add_cart(x),
-            ).pack(side="right", padx=10)
+            )
+            add_btn.pack(side="right", padx=10)
+
             c += 1
             if c >= max_cols:
                 c = 0
                 r += 1
 
     def add_cart(self, item: sqlite3.Row) -> None:
-        if item[0] in self.cart:
-            self.cart[item[0]]["qty"] += 1
+        item_id = item[0]
+        item_name = item[1]
+        current_stock = db.get_item_stock(item_id)
+
+        if current_stock is None or current_stock <= 0:
+            messagebox.showwarning("Out of Stock", f"'{item_name}' is currently out of stock.")
+            return
+
+        current_qty = self.cart.get(item_id, {}).get("qty", 0)
+        if current_qty >= current_stock:
+            messagebox.showwarning(
+                "Stock Limit",
+                f"Cannot add more '{item_name}'. Only {current_stock} available in stock."
+            )
+            return
+
+        if item_id in self.cart:
+            self.cart[item_id]["qty"] += 1
         else:
-            self.cart[item[0]] = {"name": item[1], "price": item[3], "qty": 1}
+            self.cart[item_id] = {"name": item_name, "price": item[3], "qty": 1, "stock": current_stock}
         self.update_cart()
 
     def rem_cart(self, iid: int) -> None:
@@ -700,22 +1019,64 @@ class RenusApp(ctk.CTk):
         if not self.cust_var.get():
             messagebox.showwarning("No Customer", "Select a customer before checking out.")
             return
-        cid = int(self.cust_var.get().split(" - ")[0])
+
+        # Validate customer selection
+        try:
+            cid = int(self.cust_var.get().split(" - ")[0])
+        except (ValueError, IndexError):
+            messagebox.showerror("Invalid Customer", "Please select a valid customer.")
+            return
+
+        # Check stock availability before checkout
+        insufficient = db.check_stock_availability(self.cart)
+        if insufficient:
+            error_msg = "The following items have insufficient stock:\n\n"
+            for name, requested, available in insufficient:
+                error_msg += f"• {name}: Requested {requested}, Available {available}\n"
+            error_msg += "\nPlease adjust quantities before checkout."
+            messagebox.showerror("Insufficient Stock", error_msg)
+            return
+
         total = sum(d["price"] * d["qty"] for d in self.cart.values())
-        oid = db.execute(
-            "INSERT INTO orders (customer_id, date, total, status) VALUES (?, ?, ?, 'Pending')",
-            (cid, datetime.now().strftime("%Y-%m-%d %H:%M:%S"), total),
-        )
-        db.ensure_row_code("orders", "order_code", "ORD-", oid)
-        for iid, d in self.cart.items():
-            db.execute(
-                "INSERT INTO order_items (order_id, item_id, quantity, subtotal) VALUES (?, ?, ?, ?)",
-                (oid, iid, d["qty"], d["price"] * d["qty"]),
+
+        # Validate minimum order
+        if total <= 0:
+            messagebox.showerror("Invalid Order", "Order total must be greater than 0.")
+            return
+
+        try:
+            # Use transaction for atomic order creation
+            order_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            # Create order
+            oid = db.execute(
+                "INSERT INTO orders (customer_id, date, total, status) VALUES (?, ?, ?, 'Pending')",
+                (cid, order_date, total),
             )
-        messagebox.showinfo("Success", f"Order #{oid} placed successfully")
-        self.cart = {}
-        self.update_cart()
-        self.show_history()
+            db.ensure_row_code("orders", "order_code", "ORD-", oid)
+
+            # Insert order items and update stock
+            for iid, d in self.cart.items():
+                db.execute(
+                    "INSERT INTO order_items (order_id, item_id, quantity, subtotal) VALUES (?, ?, ?, ?)",
+                    (oid, iid, d["qty"], d["price"] * d["qty"]),
+                )
+                # Deduct from stock
+                db.execute(
+                    "UPDATE items SET stock = stock - ? WHERE id = ?",
+                    (d["qty"], iid),
+                )
+
+            logger.info(f"Order {oid} created successfully for customer {cid}, total: {total}")
+            messagebox.showinfo("Success", f"Order #{oid} placed successfully!\n\nTotal: {currency(total)}")
+
+            self.cart = {}
+            self.update_cart()
+            self.show_history()
+
+        except sqlite3.Error as e:
+            logger.error(f"Checkout failed: {e}")
+            messagebox.showerror("Order Failed", "Failed to create order. Please try again.")
 
     # ---------- ORDER HISTORY ----------
     def show_history(self) -> None:
@@ -737,7 +1098,7 @@ class RenusApp(ctk.CTk):
         ).pack(side="left", padx=5)
         ctk.CTkLabel(filter_row_top, text="Month", font=("Arial", 12, "bold")).pack(side="left", padx=5)
         self.month_filter = ctk.StringVar(value="All")
-        months = ["All"] + [datetime(2024, m, 1).strftime("%b") for m in range(1, 13)]
+        months = ["All"] + [datetime(datetime.now().year, m, 1).strftime("%b") for m in range(1, 13)]
         ctk.CTkOptionMenu(
             filter_row_top,
             variable=self.month_filter,
@@ -752,7 +1113,11 @@ class RenusApp(ctk.CTk):
             textvariable=self.order_search_var,
         )
         search.pack(side="left", padx=6, fill="x", expand=True)
-        search.bind("<KeyRelease>", lambda _e: self.load_orders())
+
+        # Debounced search for better performance
+        order_debouncer = Debouncer(search, 300)
+        search.bind("<KeyRelease>", lambda _e: order_debouncer.debounce(self.load_orders))
+
         ctk.CTkButton(filter_row_top, text="✕", width=28, command=self.clear_order_filters).pack(side="left", padx=4)
 
         filter_row_dates = ctk.CTkFrame(main, fg_color="transparent")
@@ -829,7 +1194,7 @@ class RenusApp(ctk.CTk):
         date_from = self._parse_date(self.date_from_var.get().strip())
         date_to = self._parse_date(self.date_to_var.get().strip())
 
-        color_map = {"Pending": "#F57C00", "Preparing": "#1f6aa5", "Ready": THEME_COLOR, "Completed": "#757575"}
+        color_map = Theme.STATUS_COLORS
         filtered = []
         for row in rows:
             order_date = self._parse_datetime(row[3])
@@ -1301,16 +1666,20 @@ class RenusApp(ctk.CTk):
             textvariable=self.item_search_var,
         )
         search_entry.pack(side="left", fill="x", expand=True, padx=6)
-        search_entry.bind("<KeyRelease>", lambda _e: self.render_item_cards())
+
+        # Debounced search for better performance
+        item_debouncer = Debouncer(search_entry, 250)
+        search_entry.bind("<KeyRelease>", lambda _e: item_debouncer.debounce(self.render_item_cards))
+
         ctk.CTkButton(controls, text="✕", width=28, command=self.clear_item_filters).pack(side="left", padx=4)
         ctk.CTkButton(
             controls,
             text="+ Add New Item",
             width=180,
             height=40,
-            font=("Arial", 14, "bold"),
+            font=("Arial", Theme.FONT_LG, "bold"),
             command=lambda: self.item_popup(None),
-            fg_color=THEME_COLOR,
+            fg_color=Theme.PRIMARY,
         ).pack(side="right", padx=6)
 
         self.item_list_frame = ctk.CTkScrollableFrame(main)
@@ -1322,41 +1691,67 @@ class RenusApp(ctk.CTk):
             return
         for w in self.item_list_frame.winfo_children():
             w.destroy()
+
         cat = self.item_category_var.get()
         keyword = self.item_search_var.get().strip().lower()
-        items = db.fetch("SELECT id, name, category, price, stock, item_code FROM items ORDER BY id DESC")
-        found = False
+
+        # SQL-based filtering for better performance
+        query = "SELECT id, name, category, price, stock, item_code FROM items WHERE 1=1"
+        params: List = []
+        if cat != "All":
+            query += " AND category = ?"
+            params.append(cat)
+        if keyword:
+            query += " AND (LOWER(name) LIKE ? OR LOWER(item_code) LIKE ? OR LOWER(category) LIKE ?)"
+            params.extend([f"%{keyword}%", f"%{keyword}%", f"%{keyword}%"])
+        query += " ORDER BY id DESC"
+
+        items = db.fetch(query, tuple(params))
+
+        if not items:
+            ctk.CTkLabel(self.item_list_frame, text="No items match your filters.", text_color="gray").pack(pady=16)
+            return
+
         for r in items:
-            if cat != "All" and r["category"] != cat:
-                continue
             code = r["item_code"] or db.generate_code("ITM-", r["id"])
-            haystack = f"{r['name']} {r['category']} {code}".lower()
-            if keyword and keyword not in haystack:
-                continue
-            found = True
-            card = ctk.CTkFrame(self.item_list_frame, fg_color=("gray90", "#333"), corner_radius=8)
+            card = ctk.CTkFrame(self.item_list_frame, fg_color=Theme.CARD_BG, corner_radius=Theme.CARD_RADIUS)
             card.pack(fill="x", pady=5, padx=5)
-            ctk.CTkLabel(card, text=f"{r['name']}\n{code} (ID {r['id']})", font=("Arial", 14, "bold"), width=250, anchor="w").pack(
-                side="left", padx=20, pady=15
-            )
+            ctk.CTkLabel(
+                card,
+                text=f"{r['name']}\n{code} (ID {r['id']})",
+                font=("Arial", Theme.FONT_LG, "bold"),
+                width=250,
+                anchor="w"
+            ).pack(side="left", padx=20, pady=15)
             ctk.CTkLabel(card, text=r["category"], width=100, anchor="w").pack(side="left", padx=10)
-            ctk.CTkLabel(card, text=currency(r["price"]), font=("Arial", 14, "bold"), width=100, anchor="w").pack(
-                side="left", padx=10
-            )
-            ctk.CTkLabel(card, text=f"Stock: {r['stock']}").pack(side="left", padx=10)
-            ctk.CTkButton(card, text="Delete", fg_color="#E53935", width=70, command=lambda i=r["id"]: self.del_item(i)).pack(
-                side="right", padx=10
-            )
+            ctk.CTkLabel(
+                card,
+                text=currency(r["price"]),
+                font=("Arial", Theme.FONT_LG, "bold"),
+                width=100,
+                anchor="w"
+            ).pack(side="left", padx=10)
+
+            # Color-coded stock display
+            stock = r['stock']
+            stock_color = Theme.MUTED if stock > 10 else (Theme.WARNING if stock > 0 else Theme.ERROR)
+            ctk.CTkLabel(card, text=f"Stock: {stock}", text_color=stock_color).pack(side="left", padx=10)
+
+            ctk.CTkButton(
+                card,
+                text="Delete",
+                fg_color=Theme.ERROR,
+                width=70,
+                command=lambda i=r["id"]: self.del_item(i)
+            ).pack(side="right", padx=10)
             ctk.CTkButton(
                 card,
                 text="Edit",
-                fg_color=ACCENT,
+                fg_color=Theme.ACCENT,
                 text_color="black",
                 width=70,
                 command=lambda i=r["id"]: self.item_popup(i),
             ).pack(side="right", padx=5)
-        if not found:
-            ctk.CTkLabel(self.item_list_frame, text="No items match your filters.", text_color="gray").pack(pady=16)
 
     def clear_item_filters(self) -> None:
         self.item_category_var.set("All")
@@ -1487,16 +1882,20 @@ class RenusApp(ctk.CTk):
             textvariable=self.customer_search_var,
         )
         search_entry.pack(side="left", fill="x", expand=True, padx=6)
-        search_entry.bind("<KeyRelease>", lambda _e: self.render_customer_cards())
+
+        # Debounced search for better performance
+        customer_debouncer = Debouncer(search_entry, 250)
+        search_entry.bind("<KeyRelease>", lambda _e: customer_debouncer.debounce(self.render_customer_cards))
+
         ctk.CTkButton(controls, text="✕", width=28, command=self.clear_customer_filters).pack(side="left", padx=4)
         ctk.CTkButton(
             controls,
             text="+ Add Customer",
             width=200,
             height=40,
-            font=("Arial", 14, "bold"),
+            font=("Arial", Theme.FONT_LG, "bold"),
             command=lambda: self.cust_popup(None),
-            fg_color=THEME_COLOR,
+            fg_color=Theme.PRIMARY,
         ).pack(side="right", padx=6)
         self.customer_list_frame = ctk.CTkScrollableFrame(main)
         self.customer_list_frame.pack(fill="both", expand=True)
@@ -1507,42 +1906,78 @@ class RenusApp(ctk.CTk):
             return
         for w in self.customer_list_frame.winfo_children():
             w.destroy()
+
         keyword = (self.customer_search_var.get() if hasattr(self, "customer_search_var") else "").strip().lower()
-        records = db.fetch("SELECT id, name, email, address, city, phone FROM customers ORDER BY name")
-        found = False
+
+        # SQL-based filtering for better performance
+        query = "SELECT id, name, email, address, city, phone FROM customers WHERE 1=1"
+        params: List = []
+        if keyword:
+            query += """ AND (LOWER(name) LIKE ? OR LOWER(email) LIKE ?
+                        OR LOWER(COALESCE(city, '')) LIKE ? OR LOWER(COALESCE(phone, '')) LIKE ?
+                        OR LOWER(COALESCE(address, '')) LIKE ?)"""
+            params.extend([f"%{keyword}%"] * 5)
+        query += " ORDER BY name"
+
+        records = db.fetch(query, tuple(params))
+
+        if not records:
+            ctk.CTkLabel(
+                self.customer_list_frame,
+                text="No customers match your filters.",
+                text_color="gray"
+            ).pack(pady=16)
+            return
+
         for r in records:
-            haystack = f"{r['name']} {r['email']} {r['city'] or ''} {r['phone'] or ''} {r['address'] or ''}".lower()
-            if keyword and keyword not in haystack:
-                continue
-            found = True
-            card = ctk.CTkFrame(self.customer_list_frame, fg_color=("gray90", "#333"), corner_radius=8)
+            card = ctk.CTkFrame(self.customer_list_frame, fg_color=Theme.CARD_BG, corner_radius=Theme.CARD_RADIUS)
             card.pack(fill="x", pady=5, padx=5)
             info = ctk.CTkFrame(card, fg_color="transparent")
             info.pack(side="left", padx=20, pady=10)
-            ctk.CTkLabel(info, text=f"{r['name']} (ID {r['id']})", font=("Arial", 14, "bold"), anchor="w").pack(anchor="w")
-            ctk.CTkLabel(info, text=r["email"], font=("Arial", 12), text_color="gray", anchor="w").pack(anchor="w")
+            ctk.CTkLabel(
+                info,
+                text=f"{r['name']} (ID {r['id']})",
+                font=("Arial", Theme.FONT_LG, "bold"),
+                anchor="w"
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                info,
+                text=r["email"],
+                font=("Arial", Theme.FONT_MD),
+                text_color="gray",
+                anchor="w"
+            ).pack(anchor="w")
             addr = ctk.CTkFrame(card, fg_color="transparent")
             addr.pack(side="left", padx=20)
-            ctk.CTkLabel(addr, text=r["city"] or "No City", font=("Arial", 12, "bold"), anchor="w").pack(anchor="w")
-            ctk.CTkLabel(addr, text=r["address"] or "No Address", font=("Arial", 11), text_color="gray", anchor="w").pack(
+            ctk.CTkLabel(
+                addr,
+                text=r["city"] or "No City",
+                font=("Arial", Theme.FONT_MD, "bold"),
                 anchor="w"
-            )
+            ).pack(anchor="w")
+            ctk.CTkLabel(
+                addr,
+                text=r["address"] or "No Address",
+                font=("Arial", 11),
+                text_color="gray",
+                anchor="w"
+            ).pack(anchor="w")
             ctk.CTkLabel(addr, text=r["phone"] or "", font=("Arial", 11)).pack(anchor="w")
-            ctk.CTkButton(card, text="Delete", fg_color="#E53935", width=70, command=lambda i=r["id"]: self.del_cust(i)).pack(
-                side="right", padx=10
-            )
+            ctk.CTkButton(
+                card,
+                text="Delete",
+                fg_color=Theme.ERROR,
+                width=70,
+                command=lambda i=r["id"]: self.del_cust(i)
+            ).pack(side="right", padx=10)
             ctk.CTkButton(
                 card,
                 text="Edit",
-                fg_color=ACCENT,
+                fg_color=Theme.ACCENT,
                 text_color="black",
                 width=70,
                 command=lambda i=r["id"]: self.cust_popup(i),
             ).pack(side="right", padx=5)
-        if not found:
-            ctk.CTkLabel(self.customer_list_frame, text="No customers match your filters.", text_color="gray").pack(
-                pady=16
-            )
 
     def clear_customer_filters(self) -> None:
         if hasattr(self, "customer_search_var"):
@@ -1551,25 +1986,35 @@ class RenusApp(ctk.CTk):
 
     def cust_popup(self, cid: Optional[int]) -> None:
         t = ctk.CTkToplevel(self)
-        t.geometry("360x480")
+        t.geometry("400x560")
         t.title("Customer Details")
         t.grab_set()
 
-        ctk.CTkLabel(t, text="Name").pack(pady=4)
-        e1 = ctk.CTkEntry(t)
+        # Error label for inline validation feedback
+        error_label = ctk.CTkLabel(t, text="", text_color=Theme.ERROR, wraplength=350)
+        error_label.pack(pady=(10, 0))
+
+        ctk.CTkLabel(t, text="Name *", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e1 = ctk.CTkEntry(t, placeholder_text="Enter customer name")
         e1.pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="Email").pack(pady=4)
-        e2 = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="Email *", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e2 = ctk.CTkEntry(t, placeholder_text="customer@example.com")
         e2.pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="Address").pack(pady=4)
-        e3 = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="Address", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e3 = ctk.CTkEntry(t, placeholder_text="Street address")
         e3.pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="City").pack(pady=4)
-        e4 = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="City", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e4 = ctk.CTkEntry(t, placeholder_text="City name")
         e4.pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="Phone").pack(pady=4)
-        e5 = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="Phone", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e5 = ctk.CTkEntry(t, placeholder_text="+27 XX XXX XXXX")
         e5.pack(fill="x", padx=20)
+
+        ctk.CTkLabel(t, text="* Required fields", font=("Arial", Theme.FONT_SM), text_color="gray").pack(pady=6)
 
         if cid:
             d = db.fetch("SELECT name, email, address, city, phone FROM customers WHERE id=?", (cid,))[0]
@@ -1579,35 +2024,71 @@ class RenusApp(ctk.CTk):
             e4.insert(0, d[3] or "")
             e5.insert(0, d[4] or "")
 
-        def save() -> None:
-            name = e1.get().strip()
-            email = e2.get().strip()
-            if not name or not email:
-                messagebox.showerror("Validation", "Name and email are required")
-                return
-            if not valid_email(email):
-                messagebox.showerror("Validation", "Enter a valid email address")
-                return
-            if e4.get().strip() and not validate_city_name(e4.get().strip()):
-                messagebox.showerror("Validation", "Enter a valid city name")
-                return
-            if e5.get().strip() and not validate_phone(e5.get().strip()):
-                messagebox.showerror("Validation", "Enter a valid phone number")
-                return
-            if cid:
-                db.execute(
-                    "UPDATE customers SET name=?, email=?, address=?, city=?, phone=? WHERE id=?",
-                    (name, email, e3.get().strip(), e4.get().strip(), e5.get().strip(), cid),
-                )
-            else:
-                db.execute(
-                    "INSERT INTO customers (name, email, address, city, phone) VALUES (?, ?, ?, ?, ?)",
-                    (name, email, e3.get().strip(), e4.get().strip(), e5.get().strip()),
-                )
-            t.destroy()
-            self.show_customers()
+        def validate_and_save() -> None:
+            error_label.configure(text="")
 
-        ctk.CTkButton(t, text="Save", command=save, fg_color=THEME_COLOR).pack(pady=20, fill="x", padx=20)
+            # Validate name
+            valid, msg = Validators.name(e1.get(), "Name")
+            if not valid:
+                error_label.configure(text=msg)
+                e1.focus_set()
+                return
+
+            # Validate email
+            valid, msg = Validators.email(e2.get())
+            if not valid:
+                error_label.configure(text=msg)
+                e2.focus_set()
+                return
+
+            # Check email uniqueness
+            email = e2.get().strip()
+            if not db.is_email_unique(email, "customers", cid):
+                error_label.configure(text="This email is already registered to another customer")
+                e2.focus_set()
+                return
+
+            # Validate city (optional)
+            valid, msg = Validators.city(e4.get())
+            if not valid:
+                error_label.configure(text=msg)
+                e4.focus_set()
+                return
+
+            # Validate phone (optional)
+            valid, msg = Validators.phone(e5.get())
+            if not valid:
+                error_label.configure(text=msg)
+                e5.focus_set()
+                return
+
+            try:
+                name = e1.get().strip()
+                if cid:
+                    db.execute(
+                        "UPDATE customers SET name=?, email=?, address=?, city=?, phone=? WHERE id=?",
+                        (name, email, e3.get().strip(), e4.get().strip(), e5.get().strip(), cid),
+                    )
+                    logger.info(f"Customer {cid} updated: {name}")
+                else:
+                    new_id = db.execute(
+                        "INSERT INTO customers (name, email, address, city, phone) VALUES (?, ?, ?, ?, ?)",
+                        (name, email, e3.get().strip(), e4.get().strip(), e5.get().strip()),
+                    )
+                    logger.info(f"New customer created: ID {new_id}, {name}")
+                t.destroy()
+                self.show_customers()
+            except sqlite3.Error as e:
+                logger.error(f"Customer save error: {e}")
+                error_label.configure(text="Failed to save customer. Please try again.")
+
+        ctk.CTkButton(
+            t,
+            text="Save Customer",
+            command=validate_and_save,
+            fg_color=Theme.PRIMARY,
+            height=40
+        ).pack(pady=20, fill="x", padx=20)
 
     def del_cust(self, cid: int) -> None:
         if messagebox.askyesno("Confirm", "Delete customer?"):
@@ -1639,16 +2120,20 @@ class RenusApp(ctk.CTk):
             textvariable=self.user_search_var,
         )
         search_entry.pack(side="left", fill="x", expand=True, padx=6)
-        search_entry.bind("<KeyRelease>", lambda _e: self.render_user_cards())
+
+        # Debounced search for better performance
+        user_debouncer = Debouncer(search_entry, 250)
+        search_entry.bind("<KeyRelease>", lambda _e: user_debouncer.debounce(self.render_user_cards))
+
         ctk.CTkButton(controls, text="✕", width=28, command=self.clear_user_filters).pack(side="left", padx=4)
         ctk.CTkButton(
             controls,
             text="+ Add User",
             width=200,
             height=40,
-            font=("Arial", 14, "bold"),
+            font=("Arial", Theme.FONT_LG, "bold"),
             command=lambda: self.user_popup(None),
-            fg_color=THEME_COLOR,
+            fg_color=Theme.PRIMARY,
         ).pack(side="right", padx=6)
         self.user_list_frame = ctk.CTkScrollableFrame(main)
         self.user_list_frame.pack(fill="both", expand=True)
@@ -1659,39 +2144,58 @@ class RenusApp(ctk.CTk):
             return
         for w in self.user_list_frame.winfo_children():
             w.destroy()
+
         role_filter = self.user_role_filter.get() if hasattr(self, "user_role_filter") else "All"
         keyword = (self.user_search_var.get() if hasattr(self, "user_search_var") else "").strip().lower()
-        users = db.fetch("SELECT id, full_name, role, email, phone, user_code FROM users ORDER BY id DESC")
-        found = False
+
+        # SQL-based filtering for better performance
+        query = "SELECT id, full_name, role, email, phone, user_code FROM users WHERE 1=1"
+        params: List = []
+        if role_filter != "All":
+            query += " AND role = ?"
+            params.append(role_filter)
+        if keyword:
+            query += """ AND (LOWER(full_name) LIKE ? OR LOWER(email) LIKE ?
+                        OR LOWER(COALESCE(user_code, '')) LIKE ? OR LOWER(COALESCE(phone, '')) LIKE ?
+                        OR LOWER(role) LIKE ?)"""
+            params.extend([f"%{keyword}%"] * 5)
+        query += " ORDER BY id DESC"
+
+        users = db.fetch(query, tuple(params))
+
+        if not users:
+            ctk.CTkLabel(self.user_list_frame, text="No users match your filters.", text_color="gray").pack(pady=16)
+            return
+
         for r in users:
-            if role_filter != "All" and r["role"] != role_filter:
-                continue
             code = r["user_code"] or db.generate_code("USR-", r["id"])
-            haystack = f"{r['full_name']} {code} {r['email']} {r['phone'] or ''} {r['role']}".lower()
-            if keyword and keyword not in haystack:
-                continue
-            found = True
-            card = ctk.CTkFrame(self.user_list_frame, fg_color=("gray90", "#333"), corner_radius=8)
+            card = ctk.CTkFrame(self.user_list_frame, fg_color=Theme.CARD_BG, corner_radius=Theme.CARD_RADIUS)
             card.pack(fill="x", pady=5, padx=5)
-            ctk.CTkLabel(card, text=f"{r['full_name']}\n{code} (ID {r['id']})", font=("Arial", 14, "bold"), width=220, anchor="w").pack(
-                side="left", padx=20, pady=12
-            )
+            ctk.CTkLabel(
+                card,
+                text=f"{r['full_name']}\n{code} (ID {r['id']})",
+                font=("Arial", Theme.FONT_LG, "bold"),
+                width=220,
+                anchor="w"
+            ).pack(side="left", padx=20, pady=12)
             ctk.CTkLabel(card, text=r["role"], width=120, anchor="w").pack(side="left", padx=10)
             ctk.CTkLabel(card, text=r["email"], width=220, anchor="w").pack(side="left", padx=10)
             ctk.CTkLabel(card, text=r["phone"] or "").pack(side="left", padx=10)
-            ctk.CTkButton(card, text="Delete", fg_color="#E53935", width=70, command=lambda i=r["id"]: self.del_user(i)).pack(
-                side="right", padx=10
-            )
+            ctk.CTkButton(
+                card,
+                text="Delete",
+                fg_color=Theme.ERROR,
+                width=70,
+                command=lambda i=r["id"]: self.del_user(i)
+            ).pack(side="right", padx=10)
             ctk.CTkButton(
                 card,
                 text="Edit",
-                fg_color=ACCENT,
+                fg_color=Theme.ACCENT,
                 text_color="black",
                 width=70,
                 command=lambda i=r["id"]: self.user_popup(i),
             ).pack(side="right", padx=5)
-        if not found:
-            ctk.CTkLabel(self.user_list_frame, text="No users match your filters.", text_color="gray").pack(pady=16)
 
     def clear_user_filters(self) -> None:
         if hasattr(self, "user_role_filter"):
@@ -1702,66 +2206,120 @@ class RenusApp(ctk.CTk):
 
     def user_popup(self, uid: Optional[int]) -> None:
         t = ctk.CTkToplevel(self)
-        t.geometry("360x420")
+        t.geometry("400x540")
         t.title("User Details")
         t.grab_set()
 
+        # Error label for inline validation feedback
+        error_label = ctk.CTkLabel(t, text="", text_color=Theme.ERROR, wraplength=350)
+        error_label.pack(pady=(10, 0))
+
         code_label = ctk.CTkLabel(t, text="User code will be generated on save", text_color="gray")
         code_label.pack(pady=(8, 2))
-        ctk.CTkLabel(t, text="Full Name").pack(pady=4)
-        e1 = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="First Name *", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e1 = ctk.CTkEntry(t, placeholder_text="Enter first name")
         e1.pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="Surname").pack(pady=4)
-        e_surname = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="Surname *", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e_surname = ctk.CTkEntry(t, placeholder_text="Enter surname")
         e_surname.pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="Role").pack(pady=4)
+
+        ctk.CTkLabel(t, text="Role *", font=("Arial", Theme.FONT_MD)).pack(pady=4)
         role_var = ctk.StringVar(value="Manager")
         ctk.CTkOptionMenu(t, variable=role_var, values=["Owner", "Manager", "Cashier", "Kitchen"]).pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="Email").pack(pady=4)
-        e3 = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="Email *", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e3 = ctk.CTkEntry(t, placeholder_text="user@example.com")
         e3.pack(fill="x", padx=20)
-        ctk.CTkLabel(t, text="Phone").pack(pady=4)
-        e4 = ctk.CTkEntry(t)
+
+        ctk.CTkLabel(t, text="Phone", font=("Arial", Theme.FONT_MD)).pack(pady=4)
+        e4 = ctk.CTkEntry(t, placeholder_text="+27 XX XXX XXXX")
         e4.pack(fill="x", padx=20)
+
+        ctk.CTkLabel(t, text="* Required fields", font=("Arial", Theme.FONT_SM), text_color="gray").pack(pady=6)
 
         if uid:
             d = db.fetch("SELECT full_name, surname, role, email, phone, user_code FROM users WHERE id=?", (uid,))[0]
-            e1.insert(0, d[0])
-            e_surname.insert(0, d[1] or "")
+            # Extract first name from full_name (remove surname at end)
+            full_name = d[0]
+            surname = d[1] or ""
+            first_name = full_name.replace(surname, "").strip() if surname else full_name
+            e1.insert(0, first_name)
+            e_surname.insert(0, surname)
             role_var.set(d[2])
             e3.insert(0, d[3])
             e4.insert(0, d[4] or "")
             code_label.configure(text=f"User Code: {d['user_code'] or db.generate_code('USR-', uid)} | ID: {uid}")
 
-        def save() -> None:
-            name = e1.get().strip()
-            surname = e_surname.get().strip()
-            email = e3.get().strip()
-            if not name or not surname or not email:
-                messagebox.showerror("Validation", "Name, surname and email are required")
-                return
-            if not valid_email(email):
-                messagebox.showerror("Validation", "Enter a valid email address")
-                return
-            if e4.get().strip() and not validate_phone(e4.get().strip()):
-                messagebox.showerror("Validation", "Enter a valid phone number")
-                return
-            full = f"{name} {surname}".strip()
-            if uid:
-                db.execute(
-                    "UPDATE users SET full_name=?, surname=?, role=?, email=?, phone=? WHERE id=?",
-                    (full, surname, role_var.get(), email, e4.get().strip(), uid),
-                )
-            else:
-                new_uid = db.execute(
-                    "INSERT INTO users (full_name, surname, role, email, phone) VALUES (?, ?, ?, ?, ?)",
-                    (full, surname, role_var.get(), email, e4.get().strip()),
-                )
-                db.ensure_row_code("users", "user_code", "USR-", new_uid)
-            t.destroy()
-            self.show_users()
+        def validate_and_save() -> None:
+            error_label.configure(text="")
 
-        ctk.CTkButton(t, text="Save User", command=save, fg_color=THEME_COLOR).pack(pady=20, fill="x", padx=20)
+            # Validate first name
+            valid, msg = Validators.name(e1.get(), "First name")
+            if not valid:
+                error_label.configure(text=msg)
+                e1.focus_set()
+                return
+
+            # Validate surname
+            valid, msg = Validators.name(e_surname.get(), "Surname")
+            if not valid:
+                error_label.configure(text=msg)
+                e_surname.focus_set()
+                return
+
+            # Validate email
+            valid, msg = Validators.email(e3.get())
+            if not valid:
+                error_label.configure(text=msg)
+                e3.focus_set()
+                return
+
+            # Check email uniqueness
+            email = e3.get().strip()
+            if not db.is_email_unique(email, "users", uid):
+                error_label.configure(text="This email is already registered to another user")
+                e3.focus_set()
+                return
+
+            # Validate phone (optional)
+            valid, msg = Validators.phone(e4.get())
+            if not valid:
+                error_label.configure(text=msg)
+                e4.focus_set()
+                return
+
+            try:
+                name = e1.get().strip()
+                surname = e_surname.get().strip()
+                full = f"{name} {surname}".strip()
+                if uid:
+                    db.execute(
+                        "UPDATE users SET full_name=?, surname=?, role=?, email=?, phone=? WHERE id=?",
+                        (full, surname, role_var.get(), email, e4.get().strip(), uid),
+                    )
+                    logger.info(f"User {uid} updated: {full}")
+                else:
+                    new_uid = db.execute(
+                        "INSERT INTO users (full_name, surname, role, email, phone) VALUES (?, ?, ?, ?, ?)",
+                        (full, surname, role_var.get(), email, e4.get().strip()),
+                    )
+                    db.ensure_row_code("users", "user_code", "USR-", new_uid)
+                    logger.info(f"New user created: ID {new_uid}, {full}")
+                t.destroy()
+                self.show_users()
+            except sqlite3.Error as e:
+                logger.error(f"User save error: {e}")
+                error_label.configure(text="Failed to save user. Please try again.")
+
+        ctk.CTkButton(
+            t,
+            text="Save User",
+            command=validate_and_save,
+            fg_color=Theme.PRIMARY,
+            height=40
+        ).pack(pady=20, fill="x", padx=20)
 
     def del_user(self, uid: int) -> None:
         if messagebox.askyesno("Confirm", "Delete user?"):
@@ -1780,7 +2338,8 @@ class RenusApp(ctk.CTk):
         filter_row.pack(fill="x", pady=10)
         ctk.CTkLabel(filter_row, text="Month", width=80).pack(side="left", padx=10, pady=12)
         self.report_month = ctk.StringVar(value="All")
-        month_values = ["All"] + [datetime(2024, m, 1).strftime("%B") for m in range(1, 13)]
+        # Use current year for month names (any year works since we only need month names)
+        month_values = ["All"] + [datetime(datetime.now().year, m, 1).strftime("%B") for m in range(1, 13)]
         ctk.CTkOptionMenu(filter_row, variable=self.report_month, values=month_values, width=160,
                           command=lambda _=None: self.refresh_report()).pack(side="left", padx=6)
         ctk.CTkLabel(filter_row, text="Year", width=60).pack(side="left")
