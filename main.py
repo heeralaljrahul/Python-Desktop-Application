@@ -580,6 +580,43 @@ class RenusApp(ctk.CTk):
         list_frame = ctk.CTkScrollableFrame(left)
         list_frame.pack(fill="both", expand=True)
 
+        right = ctk.CTkFrame(main, width=380, fg_color=("white", "#2b2b2b"))
+        right.pack(side="right", fill="y")
+        ctk.CTkLabel(right, text="Order Details", font=("Arial", 18, "bold")).pack(pady=15)
+        self.detail_title = ctk.CTkLabel(right, text="Select an order", text_color="gray")
+        self.detail_title.pack(pady=4)
+        self.detail_frame = ctk.CTkScrollableFrame(right, fg_color="transparent")
+        self.detail_frame.pack(fill="both", expand=True, padx=10)
+        self.status_var = ctk.StringVar(value=STATUSES[0])
+        status_row = ctk.CTkFrame(right, fg_color="transparent")
+        status_row.pack(fill="x", padx=15, pady=10)
+        ctk.CTkLabel(status_row, text="Status", width=80).pack(side="left")
+        self.status_menu = ctk.CTkOptionMenu(status_row, variable=self.status_var, values=STATUSES, width=140)
+        self.status_menu.pack(side="left")
+        ctk.CTkButton(
+            right,
+            text="Update Status",
+            fg_color=ACCENT,
+            text_color="black",
+            command=self.update_status,
+        ).pack(fill="x", padx=15, pady=(0, 10))
+        self.pdf_btn = ctk.CTkButton(
+            right,
+            text="Download PDF Invoice",
+            state="disabled",
+            fg_color=THEME_COLOR,
+            command=lambda: self.gen_pdf(self.selected_order_id),
+        )
+        self.pdf_btn.pack(fill="x", padx=15, pady=6)
+        self.edit_btn = ctk.CTkButton(
+            right,
+            text="Edit Items",
+            fg_color="#1f6aa5",
+            command=lambda: self.edit_order_popup(self.selected_order_id),
+            state="disabled",
+        )
+        self.edit_btn.pack(fill="x", padx=15, pady=(0, 16))
+
         self.load_orders(list_frame)
 
     def load_orders(self, parent: ctk.CTkScrollableFrame) -> None:
