@@ -2,6 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import os
+import shutil
 import random
 import re
 import sqlite3
@@ -43,6 +44,30 @@ def ensure_positive_number(value: str, allow_zero: bool = False) -> Optional[flo
     return num
 
 
+def validate_numeric_input(action: str, value_if_allowed: str) -> bool:
+    if action == "0":
+        return True
+    try:
+        float(value_if_allowed)
+        return True
+    except ValueError:
+        return False
+
+
+def validate_int_input(action: str, value_if_allowed: str) -> bool:
+    if action == "0":
+        return True
+    return value_if_allowed.isdigit()
+
+
+def validate_city_name(city: str) -> bool:
+    return bool(re.match(r"^[A-Za-z][A-Za-z\s\-'.]*$", city)) if city else True
+
+
+def validate_phone(phone: str) -> bool:
+    return bool(re.match(r"^\+?[0-9\s-]{7,16}$", phone)) if phone else True
+
+
 class DBManager:
     def __init__(self, db_name: str = "renus_system.db"):
         self.conn = sqlite3.connect(db_name)
@@ -80,6 +105,7 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY,
                 full_name TEXT NOT NULL,
+                surname TEXT,
                 role TEXT NOT NULL,
                 email TEXT UNIQUE NOT NULL,
                 phone TEXT
@@ -116,6 +142,7 @@ class DBManager:
         self._ensure_column("customers", "city", "TEXT")
         self._ensure_column("customers", "phone", "TEXT")
         self._ensure_column("orders", "notes", "TEXT")
+        self._ensure_column("users", "surname", "TEXT")
         self.conn.commit()
         self.seed_data()
 
@@ -160,6 +187,13 @@ class DBManager:
                     (n, c, p, img_path),
                 )
 
+        # Backfill surnames for existing users if column was added later
+        missing = self.fetch("SELECT id, full_name FROM users WHERE surname IS NULL OR surname = ''")
+        for row in missing:
+            parts = row[1].split()
+            surname = parts[-1] if len(parts) > 1 else ""
+            self.execute("UPDATE users SET surname=? WHERE id=?", (surname, row[0]))
+
         if self.fetch("SELECT COUNT(*) FROM customers")[0][0] == 0:
             names = [
                 "Rahul Heeralal",
@@ -191,14 +225,15 @@ class DBManager:
 
         if self.fetch("SELECT COUNT(*) FROM users")[0][0] == 0:
             staff = [
-                ("Renu Naidoo", "Owner", "renu@delights.co.za", "+27 82 000 1111"),
-                ("Sibusiso Mkhize", "Manager", "sbu@delights.co.za", "+27 83 123 9876"),
-                ("Priya Moodley", "Cashier", "priya@delights.co.za", "+27 74 222 1111"),
+                ("Renu", "Naidoo", "Owner", "renu@delights.co.za", "+27 82 000 1111"),
+                ("Sibusiso", "Mkhize", "Manager", "sbu@delights.co.za", "+27 83 123 9876"),
+                ("Priya", "Moodley", "Cashier", "priya@delights.co.za", "+27 74 222 1111"),
             ]
-            for name, role, email, phone in staff:
+            for first, surname, role, email, phone in staff:
+                full = f"{first} {surname}".strip()
                 self.execute(
-                    "INSERT INTO users (full_name, role, email, phone) VALUES (?, ?, ?, ?)",
-                    (name, role, email, phone),
+                    "INSERT INTO users (full_name, surname, role, email, phone) VALUES (?, ?, ?, ?, ?)",
+                    (full, surname, role, email, phone),
                 )
 
         if self.fetch("SELECT COUNT(*) FROM orders")[0][0] == 0:
@@ -634,21 +669,25 @@ class RenusApp(ctk.CTk):
             ctk.CTkLabel(display, text=currency(row[4]), width=100, anchor="e", font=("Arial", 12, "bold")).pack(
                 side="left", padx=6
             )
-            ctk.CTkButton(display, text="View", width=60, height=28, command=lambda oid=row[0]: self.load_details(oid)).pack(
-                side="right", padx=6
-            )
+            ctk.CTkButton(
+                display,
+                text="View",
+                width=60,
+                height=28,
+                command=lambda oid=row[0]: self.order_details_popup(oid),
+            ).pack(side="right", padx=6)
 
-    def load_details(self, oid: int) -> None:
-        self.selected_order_id = oid
-        self.pdf_btn.configure(state="normal")
-        status = db.status_for_order(oid)
-        status = db.normalize_status(status)
-        self.status_var.set(status)
-        self.status_menu.configure(state="normal" if status != "Completed" else "disabled")
-        self.detail_title.configure(text=f"Order #{oid}", text_color=("black", "white"))
+    def order_details_popup(self, oid: int) -> None:
+        status = db.normalize_status(db.status_for_order(oid))
+        t = ctk.CTkToplevel(self)
+        t.title(f"Order #{oid} Details")
+        t.geometry("420x680")
+        t.grab_set()
 
-        for w in self.detail_frame.winfo_children():
-            w.destroy()
+        ctk.CTkLabel(t, text=f"Order #{oid}", font=("Arial", 20, "bold")).pack(pady=6)
+        detail_frame = ctk.CTkScrollableFrame(t, fg_color="transparent", height=320)
+        detail_frame.pack(fill="both", expand=True, padx=10, pady=6)
+
         items = db.fetch(
             "SELECT i.name, oi.quantity, oi.subtotal FROM order_items oi JOIN items i ON oi.item_id = i.id WHERE oi.order_id=?",
             (oid,),
@@ -656,27 +695,55 @@ class RenusApp(ctk.CTk):
         total = 0
         for name, qty, subtotal in items:
             total += subtotal
-            row = ctk.CTkFrame(self.detail_frame, fg_color=("gray95", "#333"))
+            row = ctk.CTkFrame(detail_frame, fg_color=("gray95", "#333"))
             row.pack(fill="x", pady=3)
             ctk.CTkLabel(row, text=f"{name} x{qty}", anchor="w").pack(side="left", padx=8)
             ctk.CTkLabel(row, text=currency(subtotal)).pack(side="right", padx=8)
 
-        ctk.CTkLabel(self.detail_frame, text=f"Total: {currency(total)}", font=("Arial", 14, "bold")).pack(
-            anchor="e", padx=8, pady=6
-        )
-        self.edit_btn.configure(state="normal" if status != "Completed" else "disabled")
+        ctk.CTkLabel(t, text=f"Total: {currency(total)}", font=("Arial", 15, "bold")).pack(pady=6)
 
-    def update_status(self) -> None:
-        if not self.selected_order_id:
-            return
-        current = db.normalize_status(db.status_for_order(self.selected_order_id))
-        new_status = self.status_var.get()
-        if current == "Completed":
-            messagebox.showerror("Locked", "Completed orders cannot be edited.")
-            return
-        db.execute("UPDATE orders SET status=? WHERE id=?", (new_status, self.selected_order_id))
-        messagebox.showinfo("Updated", f"Order #{self.selected_order_id} status set to {new_status}")
-        self.show_history()
+        status_var = ctk.StringVar(value=status)
+        status_row = ctk.CTkFrame(t, fg_color="transparent")
+        status_row.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(status_row, text="Status", width=80).pack(side="left")
+        status_menu = ctk.CTkOptionMenu(status_row, variable=status_var, values=STATUSES, width=140)
+        status_menu.configure(state="normal" if status != "Completed" else "disabled")
+        status_menu.pack(side="left")
+
+        def update_status() -> None:
+            current = db.normalize_status(db.status_for_order(oid))
+            new_status = status_var.get()
+            if current == "Completed":
+                messagebox.showerror("Locked", "Completed orders cannot be edited.")
+                return
+            db.execute("UPDATE orders SET status=? WHERE id=?", (new_status, oid))
+            messagebox.showinfo("Updated", f"Order #{oid} status set to {new_status}")
+            t.destroy()
+            self.show_history()
+
+        ctk.CTkButton(
+            t,
+            text="Update Status",
+            fg_color=ACCENT,
+            text_color="black",
+            command=update_status,
+            state="normal" if status != "Completed" else "disabled",
+        ).pack(fill="x", padx=12, pady=6)
+
+        ctk.CTkButton(
+            t,
+            text="Download PDF Invoice",
+            fg_color=THEME_COLOR,
+            command=lambda: self.gen_pdf(oid),
+        ).pack(fill="x", padx=12, pady=4)
+
+        ctk.CTkButton(
+            t,
+            text="Edit Items",
+            fg_color="#1f6aa5",
+            state="normal" if status != "Completed" else "disabled",
+            command=lambda: [t.destroy(), self.edit_order_popup(oid)],
+        ).pack(fill="x", padx=12, pady=6)
 
     def edit_order_popup(self, oid: Optional[int]) -> None:
         if not oid:
@@ -803,13 +870,13 @@ class RenusApp(ctk.CTk):
 
         c = canvas.Canvas(file, pagesize=letter)
         c.setFillColor(colors.HexColor(THEME_COLOR))
-        c.rect(0, 750, 612, 92, fill=True, stroke=False)
+        c.rect(0, 742, 612, 100, fill=True, stroke=False)
         c.setFillColor(colors.white)
         c.setFont("Helvetica-Bold", 22)
         c.drawString(40, 800, APP_NAME)
-        c.setFont("Helvetica", 11)
-        c.drawString(40, 782, APP_LOCATION)
-        c.drawString(40, 764, "Gourmet Durban curries & spices")
+        c.setFont("Helvetica", 12)
+        c.drawString(40, 780, APP_LOCATION)
+        c.drawString(40, 762, "Gourmet Durban curries & spices")
 
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", 14)
@@ -843,6 +910,9 @@ class RenusApp(ctk.CTk):
         c.setFont("Helvetica-Bold", 14)
         c.drawString(360, y - 24, "Grand Total:")
         c.drawString(460, y - 24, currency(data[3]))
+        c.setFont("Helvetica", 12)
+        c.drawString(40, y - 48, "Thank you for your order!")
+        c.drawString(40, y - 64, "For any issues or queries, email renusdelights@gmail.com")
         c.save()
         messagebox.showinfo("Saved", "Invoice PDF generated")
 
@@ -892,6 +962,9 @@ class RenusApp(ctk.CTk):
         t.title("Item Details")
         t.grab_set()
 
+        vcmd_float = (t.register(validate_numeric_input), "%d", "%P")
+        vcmd_int = (t.register(validate_int_input), "%d", "%P")
+
         ctk.CTkLabel(t, text="Name").pack(pady=6)
         name_e = ctk.CTkEntry(t)
         name_e.pack(fill="x", padx=20)
@@ -899,20 +972,60 @@ class RenusApp(ctk.CTk):
         cat_var = ctk.StringVar(value="Menu")
         ctk.CTkOptionMenu(t, variable=cat_var, values=["Menu", "Spice", "Snack"]).pack(fill="x", padx=20)
         ctk.CTkLabel(t, text="Price (R)").pack(pady=6)
-        price_e = ctk.CTkEntry(t)
+        price_e = ctk.CTkEntry(t, validate="key", validatecommand=vcmd_float)
         price_e.pack(fill="x", padx=20)
         ctk.CTkLabel(t, text="Stock").pack(pady=6)
-        stock_e = ctk.CTkEntry(t)
+        stock_e = ctk.CTkEntry(t, validate="key", validatecommand=vcmd_int)
         stock_e.pack(fill="x", padx=20)
 
+        img_frame = ctk.CTkFrame(t, fg_color="transparent")
+        img_frame.pack(pady=8, padx=20, fill="x")
+        ctk.CTkLabel(img_frame, text="Image").pack(anchor="w")
+        preview_label = ctk.CTkLabel(img_frame, text="No image", anchor="w")
+        preview_label.pack(fill="x", pady=4)
+        selected_image_path = os.path.abspath("assets/placeholder.png")
+
+        def set_preview(path: str) -> None:
+            nonlocal selected_image_path
+            selected_image_path = path
+            try:
+                img = ctk.CTkImage(Image.open(path), size=(80, 80))
+                preview_label.configure(text="", image=img)
+                preview_label.image = img
+            except Exception:
+                preview_label.configure(text=os.path.basename(path), image=None)
+
+        def upload_image() -> None:
+            file_path = filedialog.askopenfilename(filetypes=[("Image files", "*.png;*.jpg;*.jpeg;*.gif")])
+            if not file_path:
+                return
+            try:
+                dest_dir = "assets"
+                os.makedirs(dest_dir, exist_ok=True)
+                dest_path = os.path.join(dest_dir, os.path.basename(file_path))
+                base, ext = os.path.splitext(dest_path)
+                counter = 1
+                while os.path.exists(dest_path):
+                    dest_path = f"{base}_{counter}{ext}"
+                    counter += 1
+                shutil.copyfile(file_path, dest_path)
+                set_preview(os.path.abspath(dest_path))
+            except Exception as exc:
+                messagebox.showerror("Image", f"Failed to add image: {exc}")
+
+        ctk.CTkButton(img_frame, text="Upload Image", fg_color=THEME_COLOR, command=upload_image).pack(fill="x")
+
         if iid:
-            d = db.fetch("SELECT name, category, price, stock FROM items WHERE id=?", (iid,))[0]
+            d = db.fetch("SELECT name, category, price, stock, image_path FROM items WHERE id=?", (iid,))[0]
             name_e.insert(0, d[0])
             cat_var.set(d[1])
             price_e.insert(0, str(d[2]))
             stock_e.insert(0, str(d[3]))
+            if d[4]:
+                set_preview(d[4])
         else:
             stock_e.insert(0, "50")
+            set_preview(selected_image_path)
 
         def save() -> None:
             name = name_e.get().strip()
@@ -927,11 +1040,11 @@ class RenusApp(ctk.CTk):
             if stock_val is None:
                 messagebox.showerror("Validation", "Enter a valid stock number")
                 return
-            path = os.path.abspath("assets/placeholder.png")
+            path = selected_image_path or os.path.abspath("assets/placeholder.png")
             if iid:
                 db.execute(
-                    "UPDATE items SET name=?, category=?, price=?, stock=? WHERE id=?",
-                    (name, cat_var.get(), price, int(stock_val), iid),
+                    "UPDATE items SET name=?, category=?, price=?, stock=?, image_path=? WHERE id=?",
+                    (name, cat_var.get(), price, int(stock_val), path, iid),
                 )
             else:
                 db.execute(
@@ -1030,6 +1143,12 @@ class RenusApp(ctk.CTk):
             if not valid_email(email):
                 messagebox.showerror("Validation", "Enter a valid email address")
                 return
+            if e4.get().strip() and not validate_city_name(e4.get().strip()):
+                messagebox.showerror("Validation", "Enter a valid city name")
+                return
+            if e5.get().strip() and not validate_phone(e5.get().strip()):
+                messagebox.showerror("Validation", "Enter a valid phone number")
+                return
             if cid:
                 db.execute(
                     "UPDATE customers SET name=?, email=?, address=?, city=?, phone=? WHERE id=?",
@@ -1097,6 +1216,9 @@ class RenusApp(ctk.CTk):
         ctk.CTkLabel(t, text="Full Name").pack(pady=4)
         e1 = ctk.CTkEntry(t)
         e1.pack(fill="x", padx=20)
+        ctk.CTkLabel(t, text="Surname").pack(pady=4)
+        e_surname = ctk.CTkEntry(t)
+        e_surname.pack(fill="x", padx=20)
         ctk.CTkLabel(t, text="Role").pack(pady=4)
         role_var = ctk.StringVar(value="Manager")
         ctk.CTkOptionMenu(t, variable=role_var, values=["Owner", "Manager", "Cashier", "Kitchen"]).pack(fill="x", padx=20)
@@ -1108,30 +1230,36 @@ class RenusApp(ctk.CTk):
         e4.pack(fill="x", padx=20)
 
         if uid:
-            d = db.fetch("SELECT full_name, role, email, phone FROM users WHERE id=?", (uid,))[0]
+            d = db.fetch("SELECT full_name, surname, role, email, phone FROM users WHERE id=?", (uid,))[0]
             e1.insert(0, d[0])
-            role_var.set(d[1])
-            e3.insert(0, d[2])
-            e4.insert(0, d[3] or "")
+            e_surname.insert(0, d[1] or "")
+            role_var.set(d[2])
+            e3.insert(0, d[3])
+            e4.insert(0, d[4] or "")
 
         def save() -> None:
             name = e1.get().strip()
+            surname = e_surname.get().strip()
             email = e3.get().strip()
-            if not name or not email:
-                messagebox.showerror("Validation", "Name and email are required")
+            if not name or not surname or not email:
+                messagebox.showerror("Validation", "Name, surname and email are required")
                 return
             if not valid_email(email):
                 messagebox.showerror("Validation", "Enter a valid email address")
                 return
+            if e4.get().strip() and not validate_phone(e4.get().strip()):
+                messagebox.showerror("Validation", "Enter a valid phone number")
+                return
+            full = f"{name} {surname}".strip()
             if uid:
                 db.execute(
-                    "UPDATE users SET full_name=?, role=?, email=?, phone=? WHERE id=?",
-                    (name, role_var.get(), email, e4.get().strip(), uid),
+                    "UPDATE users SET full_name=?, surname=?, role=?, email=?, phone=? WHERE id=?",
+                    (full, surname, role_var.get(), email, e4.get().strip(), uid),
                 )
             else:
                 db.execute(
-                    "INSERT INTO users (full_name, role, email, phone) VALUES (?, ?, ?, ?)",
-                    (name, role_var.get(), email, e4.get().strip()),
+                    "INSERT INTO users (full_name, surname, role, email, phone) VALUES (?, ?, ?, ?, ?)",
+                    (full, surname, role_var.get(), email, e4.get().strip()),
                 )
             t.destroy()
             self.show_users()
