@@ -402,8 +402,10 @@ class RenusApp(ctk.CTk):
         super().__init__()
         self.title(f"{APP_NAME} | Manager")
         self.geometry("1500x950")
+        self.after(100, self._maximize_window)
         self.logo_img = ctk.CTkImage(Image.open("assets/logo.png"), size=(44, 44))
         self.cart: Dict[int, Dict] = {}
+        self.date_picker_win: Optional[ctk.CTkToplevel] = None
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -412,6 +414,12 @@ class RenusApp(ctk.CTk):
         self.content = ctk.CTkFrame(self, corner_radius=0, fg_color=("gray92", "gray10"))
         self.content.grid(row=0, column=1, sticky="nsew")
         self.show_new_order()
+
+    def _maximize_window(self) -> None:
+        try:
+            self.state("zoomed")
+        except tk.TclError:
+            self.attributes("-fullscreen", True)
 
     # ---------- LAYOUT HELPERS ----------
     def create_sidebar(self) -> None:
@@ -474,10 +482,13 @@ class RenusApp(ctk.CTk):
 
         split = ctk.CTkFrame(self.content, fg_color="transparent")
         split.pack(fill="both", expand=True, padx=20, pady=20)
+        split.grid_columnconfigure(0, weight=1, uniform="split")
+        split.grid_columnconfigure(1, weight=1, uniform="split")
+        split.grid_rowconfigure(0, weight=1)
 
         # Left: Menu grid
         menu_frame = ctk.CTkFrame(split, fg_color="transparent")
-        menu_frame.pack(side="left", fill="both", expand=True, padx=(0, 18))
+        menu_frame.grid(row=0, column=0, sticky="nsew", padx=(0, 12))
 
         filter_row = ctk.CTkFrame(menu_frame, fg_color="transparent")
         filter_row.pack(fill="x", pady=(0, 8))
@@ -496,15 +507,36 @@ class RenusApp(ctk.CTk):
         self.load_grid(scroll)
 
         # Right: Cart
-        cart = ctk.CTkFrame(split, width=520, fg_color=("white", "#2b2b2b"))
-        cart.pack(side="right", fill="y")
+        cart = ctk.CTkFrame(split, fg_color=("white", "#2b2b2b"))
+        cart.grid(row=0, column=1, sticky="nsew", padx=(12, 0))
+        cart.grid_rowconfigure(3, weight=1)
         ctk.CTkLabel(cart, text="Current Order", font=("Arial", 18, "bold")).pack(pady=15)
 
         custs = db.fetch("SELECT id, name FROM customers ORDER BY name")
         customer_values = [f"{c['id']} - {c['name']}" for c in custs]
         self.cust_var = ctk.StringVar(value=customer_values[0] if customer_values else "")
-        ctk.CTkOptionMenu(cart, variable=self.cust_var, values=customer_values or ["No customers"],
-                          state="normal" if customer_values else "disabled").pack(fill="x", padx=20)
+        self.all_customer_values = customer_values
+        search_holder = ctk.CTkFrame(cart, fg_color="transparent")
+        search_holder.pack(fill="x", padx=20)
+        self.customer_search_var = ctk.StringVar()
+        search_box = ctk.CTkEntry(
+            search_holder,
+            placeholder_text="Search customer",
+            textvariable=self.customer_search_var,
+        )
+        search_box.pack(side="left", fill="x", expand=True, pady=(0, 6))
+        search_box.bind("<KeyRelease>", lambda _e: self.filter_customers())
+        ctk.CTkButton(search_holder, text="✕", width=32, command=self.clear_customer_search).pack(
+            side="left", padx=(6, 0), pady=(0, 6)
+        )
+
+        self.customer_box = ctk.CTkComboBox(
+            cart,
+            variable=self.cust_var,
+            values=customer_values or ["No customers"],
+            state="readonly" if customer_values else "disabled",
+        )
+        self.customer_box.pack(fill="x", padx=20)
 
         self.cart_frame = ctk.CTkScrollableFrame(cart, fg_color="transparent")
         self.cart_frame.pack(fill="both", expand=True, padx=10, pady=10)
@@ -528,6 +560,39 @@ class RenusApp(ctk.CTk):
         self.search_var.set("")
         self.load_grid(target)
 
+    def filter_customers(self) -> None:
+        if not hasattr(self, "customer_box"):
+            return
+        query = self.customer_search_var.get().lower().strip()
+        if not self.all_customer_values:
+            self.customer_box.configure(values=["No customers"], state="disabled")
+            self.cust_var.set("")
+            return
+        filtered = [v for v in self.all_customer_values if query in v.lower()]
+        if filtered:
+            self.customer_box.configure(values=filtered, state="readonly")
+            current = self.cust_var.get()
+            if current in filtered:
+                self.cust_var.set(current)
+            elif current:
+                self.cust_var.set(filtered[0])
+            else:
+                self.cust_var.set("")
+        else:
+            self.customer_box.configure(values=["No matches"], state="disabled")
+            self.cust_var.set("")
+
+    def clear_customer_search(self) -> None:
+        if not hasattr(self, "customer_box"):
+            return
+        self.customer_search_var.set("")
+        if self.all_customer_values:
+            self.customer_box.configure(values=self.all_customer_values, state="readonly")
+            self.cust_var.set("")
+        else:
+            self.customer_box.configure(values=["No customers"], state="disabled")
+            self.cust_var.set("")
+
     def load_grid(self, parent: ctk.CTkScrollableFrame) -> None:
         for w in parent.winfo_children():
             w.destroy()
@@ -539,6 +604,9 @@ class RenusApp(ctk.CTk):
             q += " WHERE category=?"
             params = (cat,)
         items = db.fetch(q, params)
+        max_cols = 2
+        for col in range(max_cols):
+            parent.grid_columnconfigure(col, weight=1)
         r = c = 0
         for item in items:
             if keyword and keyword not in item[1].lower():
@@ -564,7 +632,7 @@ class RenusApp(ctk.CTk):
                 command=lambda x=item: self.add_cart(x),
             ).pack(side="right", padx=10)
             c += 1
-            if c > 2:
+            if c >= max_cols:
                 c = 0
                 r += 1
 
@@ -593,20 +661,19 @@ class RenusApp(ctk.CTk):
         for w in self.cart_frame.winfo_children():
             w.destroy()
         self.cart_frame.grid_columnconfigure(0, weight=1)
-        self.cart_frame.grid_columnconfigure(1, weight=1)
         total = 0
         for idx, (iid, data) in enumerate(self.cart.items()):
             subtotal = data["price"] * data["qty"]
             total += subtotal
             card = ctk.CTkFrame(self.cart_frame, fg_color=("gray95", "#333"), corner_radius=10)
-            card.grid(row=idx // 2, column=idx % 2, padx=8, pady=6, sticky="nsew")
+            card.grid(row=idx, column=0, padx=8, pady=6, sticky="nsew")
             card.grid_columnconfigure(0, weight=1)
 
             header = ctk.CTkFrame(card, fg_color="transparent")
             header.grid(row=0, column=0, sticky="ew", pady=(6, 0), padx=8)
             header.grid_columnconfigure(0, weight=1)
             ctk.CTkLabel(
-                header, text=data["name"], anchor="w", wraplength=200, font=("Arial", 13, "bold")
+                header, text=data["name"], anchor="w", wraplength=260, font=("Arial", 13, "bold")
             ).grid(row=0, column=0, sticky="w")
             ctk.CTkButton(
                 header, text="x", width=26, fg_color="red", command=lambda x=iid: self.rem_cart(x)
@@ -846,11 +913,15 @@ class RenusApp(ctk.CTk):
             return None
 
     def _open_date_picker(self, target_var: tk.StringVar, anchor_widget: tk.Widget) -> None:
+        if self.date_picker_win and self.date_picker_win.winfo_exists():
+            self.date_picker_win.focus_set()
+            return
         current = self._parse_date(target_var.get()) or datetime.now()
         month_var = tk.IntVar(value=current.month)
         year_var = tk.IntVar(value=current.year)
 
         picker = ctk.CTkToplevel(self)
+        self.date_picker_win = picker
         picker.title("Select Date")
         picker.resizable(False, False)
         try:
@@ -860,6 +931,13 @@ class RenusApp(ctk.CTk):
         except Exception:
             picker.geometry("+200+200")
         picker.grab_set()
+
+        def close_picker() -> None:
+            if picker.winfo_exists():
+                picker.destroy()
+            self.date_picker_win = None
+
+        picker.protocol("WM_DELETE_WINDOW", close_picker)
 
         header = ctk.CTkFrame(picker, fg_color="transparent")
         header.pack(fill="x", padx=10, pady=(8, 4))
@@ -888,7 +966,7 @@ class RenusApp(ctk.CTk):
         def select_day(day: int) -> None:
             selected = datetime(year_var.get(), month_var.get(), day)
             target_var.set(selected.strftime("%Y-%m-%d"))
-            picker.destroy()
+            close_picker()
             self.load_orders()
 
         def render_days() -> None:
@@ -914,6 +992,7 @@ class RenusApp(ctk.CTk):
                     col = 0
                     row += 1
 
+        picker.bind("<Destroy>", lambda _e: setattr(self, "date_picker_win", None))
         render_days()
 
     def clear_order_filters(self) -> None:
