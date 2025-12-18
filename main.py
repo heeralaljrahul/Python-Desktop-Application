@@ -6,6 +6,7 @@ import shutil
 import random
 import re
 import sqlite3
+import calendar
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 
@@ -15,8 +16,9 @@ from reportlab.lib.pagesizes import A4, letter
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 
-APP_NAME = "Renu's Authentic Delights"
-APP_LOCATION = "Durban, South Africa"
+APP_NAME = "RENUS AUTHENTIC DELIGHTS"
+APP_LOCATION = "Pretoria, South Africa"
+APP_TAGLINE = "Gourmet Pretoria curries & spices"
 STATUSES = ["Pending", "Preparing", "Ready", "Completed"]
 THEME_COLOR = "#2CC985"
 ACCENT = "#FBC02D"
@@ -494,7 +496,7 @@ class RenusApp(ctk.CTk):
         self.load_grid(scroll)
 
         # Right: Cart
-        cart = ctk.CTkFrame(split, width=420, fg_color=("white", "#2b2b2b"))
+        cart = ctk.CTkFrame(split, width=520, fg_color=("white", "#2b2b2b"))
         cart.pack(side="right", fill="y")
         ctk.CTkLabel(cart, text="Current Order", font=("Arial", 18, "bold")).pack(pady=15)
 
@@ -577,20 +579,51 @@ class RenusApp(ctk.CTk):
         self.cart.pop(iid, None)
         self.update_cart()
 
+    def change_cart_qty(self, iid: int, delta: int) -> None:
+        if iid not in self.cart:
+            return
+        self.cart[iid]["qty"] += delta
+        if self.cart[iid]["qty"] <= 0:
+            self.cart.pop(iid, None)
+        self.update_cart()
+
     def update_cart(self) -> None:
+        if not hasattr(self, "cart_frame") or not self.cart_frame.winfo_exists():
+            return
         for w in self.cart_frame.winfo_children():
             w.destroy()
+        self.cart_frame.grid_columnconfigure(0, weight=1)
+        self.cart_frame.grid_columnconfigure(1, weight=1)
         total = 0
-        for iid, data in self.cart.items():
+        for idx, (iid, data) in enumerate(self.cart.items()):
             subtotal = data["price"] * data["qty"]
             total += subtotal
-            row = ctk.CTkFrame(self.cart_frame, fg_color=("gray95", "#333"), corner_radius=8)
-            row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=f"{data['name']} (x{data['qty']})", anchor="w").pack(side="left", padx=5)
-            ctk.CTkLabel(row, text=currency(subtotal), anchor="e").pack(side="right", padx=5)
-            ctk.CTkButton(row, text="x", width=26, fg_color="red", command=lambda x=iid: self.rem_cart(x)).pack(
-                side="right", padx=5
+            card = ctk.CTkFrame(self.cart_frame, fg_color=("gray95", "#333"), corner_radius=10)
+            card.grid(row=idx // 2, column=idx % 2, padx=8, pady=6, sticky="nsew")
+            card.grid_columnconfigure(0, weight=1)
+
+            header = ctk.CTkFrame(card, fg_color="transparent")
+            header.grid(row=0, column=0, sticky="ew", pady=(6, 0), padx=8)
+            header.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(
+                header, text=data["name"], anchor="w", wraplength=200, font=("Arial", 13, "bold")
+            ).grid(row=0, column=0, sticky="w")
+            ctk.CTkButton(
+                header, text="x", width=26, fg_color="red", command=lambda x=iid: self.rem_cart(x)
+            ).grid(row=0, column=1, padx=(8, 0))
+
+            controls = ctk.CTkFrame(card, fg_color="transparent")
+            controls.grid(row=1, column=0, sticky="w", padx=8, pady=(6, 4))
+            ctk.CTkButton(controls, text="-", width=30, command=lambda x=iid: self.change_cart_qty(x, -1)).pack(
+                side="left", padx=2
             )
+            ctk.CTkLabel(controls, text=str(data["qty"]), width=34, anchor="center").pack(side="left", padx=2)
+            ctk.CTkButton(controls, text="+", width=30, command=lambda x=iid: self.change_cart_qty(x, 1)).pack(
+                side="left", padx=2
+            )
+            ctk.CTkLabel(
+                card, text=currency(subtotal), anchor="e", font=("Arial", 12, "bold")
+            ).grid(row=2, column=0, sticky="e", padx=12, pady=(0, 8))
         self.total_lbl.configure(text=f"Total: {currency(total)}")
 
     def checkout(self) -> None:
@@ -624,33 +657,60 @@ class RenusApp(ctk.CTk):
         main = ctk.CTkFrame(self.content, fg_color="transparent")
         main.pack(fill="both", expand=True, padx=20, pady=20)
 
-        filter_row = ctk.CTkFrame(main, fg_color="transparent")
-        filter_row.pack(fill="x", pady=(0, 8))
-        ctk.CTkLabel(filter_row, text="Status", font=("Arial", 12, "bold")).pack(side="left", padx=5)
+        filter_row_top = ctk.CTkFrame(main, fg_color="transparent")
+        filter_row_top.pack(fill="x", pady=(0, 4))
+        ctk.CTkLabel(filter_row_top, text="Status", font=("Arial", 12, "bold")).pack(side="left", padx=5)
         self.status_filter = ctk.StringVar(value="All")
-        ctk.CTkOptionMenu(filter_row, variable=self.status_filter, values=["All"] + STATUSES, width=120,
-                          command=lambda _: self.load_orders()).pack(side="left", padx=5)
-        ctk.CTkLabel(filter_row, text="Month", font=("Arial", 12, "bold")).pack(side="left", padx=5)
+        ctk.CTkOptionMenu(
+            filter_row_top,
+            variable=self.status_filter,
+            values=["All"] + STATUSES,
+            width=120,
+            command=lambda _: self.load_orders(),
+        ).pack(side="left", padx=5)
+        ctk.CTkLabel(filter_row_top, text="Month", font=("Arial", 12, "bold")).pack(side="left", padx=5)
         self.month_filter = ctk.StringVar(value="All")
         months = ["All"] + [datetime(2024, m, 1).strftime("%b") for m in range(1, 13)]
-        ctk.CTkOptionMenu(filter_row, variable=self.month_filter, values=months, width=100,
-                          command=lambda _: self.load_orders()).pack(side="left", padx=5)
-        ctk.CTkLabel(filter_row, text="Date From", font=("Arial", 12, "bold")).pack(side="left", padx=5)
-        self.date_from_var = ctk.StringVar()
-        date_from = ctk.CTkEntry(filter_row, width=120, placeholder_text="YYYY-MM-DD", textvariable=self.date_from_var)
-        date_from.pack(side="left", padx=4)
-        date_from.bind("<KeyRelease>", lambda _e: self.load_orders())
-        ctk.CTkLabel(filter_row, text="To", font=("Arial", 12, "bold")).pack(side="left")
-        self.date_to_var = ctk.StringVar()
-        date_to = ctk.CTkEntry(filter_row, width=120, placeholder_text="YYYY-MM-DD", textvariable=self.date_to_var)
-        date_to.pack(side="left", padx=4)
-        date_to.bind("<KeyRelease>", lambda _e: self.load_orders())
+        ctk.CTkOptionMenu(
+            filter_row_top,
+            variable=self.month_filter,
+            values=months,
+            width=100,
+            command=lambda _: self.load_orders(),
+        ).pack(side="left", padx=5)
         self.order_search_var = ctk.StringVar()
-        search = ctk.CTkEntry(filter_row, placeholder_text="Search by ID, customer, status, item...",
-                              textvariable=self.order_search_var)
+        search = ctk.CTkEntry(
+            filter_row_top,
+            placeholder_text="Search by ID, customer, status, item...",
+            textvariable=self.order_search_var,
+        )
         search.pack(side="left", padx=6, fill="x", expand=True)
         search.bind("<KeyRelease>", lambda _e: self.load_orders())
-        ctk.CTkButton(filter_row, text="✕", width=28, command=self.clear_order_filters).pack(side="left", padx=4)
+        ctk.CTkButton(filter_row_top, text="✕", width=28, command=self.clear_order_filters).pack(side="left", padx=4)
+
+        filter_row_dates = ctk.CTkFrame(main, fg_color="transparent")
+        filter_row_dates.pack(fill="x", pady=(0, 8))
+        self.date_from_var = ctk.StringVar()
+        self.date_to_var = ctk.StringVar()
+
+        def build_date_field(label_text: str, variable: tk.StringVar) -> Tuple[ctk.CTkFrame, ctk.CTkEntry]:
+            wrapper = ctk.CTkFrame(filter_row_dates, fg_color="transparent")
+            ctk.CTkLabel(wrapper, text=label_text, font=("Arial", 12, "bold")).pack(side="left", padx=(0, 5))
+            entry = ctk.CTkEntry(wrapper, width=140, placeholder_text="YYYY-MM-DD", textvariable=variable)
+            entry.pack(side="left")
+            entry.bind("<KeyRelease>", lambda _e: self.load_orders())
+            ctk.CTkButton(
+                wrapper,
+                text="📅",
+                width=32,
+                command=lambda v=variable, e=entry: self._open_date_picker(v, e),
+            ).pack(side="left", padx=(6, 0))
+            return wrapper, entry
+
+        from_field, self.date_from_entry = build_date_field("Date From", self.date_from_var)
+        to_field, self.date_to_entry = build_date_field("To", self.date_to_var)
+        from_field.pack(side="left", padx=5)
+        to_field.pack(side="left", padx=5)
 
         self.order_list_frame = ctk.CTkScrollableFrame(main)
         self.order_list_frame.pack(fill="both", expand=True)
@@ -785,11 +845,86 @@ class RenusApp(ctk.CTk):
         except (TypeError, ValueError):
             return None
 
+    def _open_date_picker(self, target_var: tk.StringVar, anchor_widget: tk.Widget) -> None:
+        current = self._parse_date(target_var.get()) or datetime.now()
+        month_var = tk.IntVar(value=current.month)
+        year_var = tk.IntVar(value=current.year)
+
+        picker = ctk.CTkToplevel(self)
+        picker.title("Select Date")
+        picker.resizable(False, False)
+        try:
+            x = anchor_widget.winfo_rootx()
+            y = anchor_widget.winfo_rooty() + anchor_widget.winfo_height()
+            picker.geometry(f"+{x}+{y}")
+        except Exception:
+            picker.geometry("+200+200")
+        picker.grab_set()
+
+        header = ctk.CTkFrame(picker, fg_color="transparent")
+        header.pack(fill="x", padx=10, pady=(8, 4))
+        title_lbl = ctk.CTkLabel(header, text="", font=("Arial", 13, "bold"))
+        title_lbl.pack(side="left", expand=True)
+
+        def change_month(delta: int) -> None:
+            m = month_var.get() + delta
+            y_val = year_var.get()
+            if m < 1:
+                m = 12
+                y_val -= 1
+            elif m > 12:
+                m = 1
+                y_val += 1
+            month_var.set(m)
+            year_var.set(y_val)
+            render_days()
+
+        ctk.CTkButton(header, text="◀", width=32, command=lambda: change_month(-1)).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(header, text="▶", width=32, command=lambda: change_month(1)).pack(side="right", padx=(6, 0))
+
+        grid = ctk.CTkFrame(picker, fg_color="transparent")
+        grid.pack(padx=10, pady=(0, 10))
+
+        def select_day(day: int) -> None:
+            selected = datetime(year_var.get(), month_var.get(), day)
+            target_var.set(selected.strftime("%Y-%m-%d"))
+            picker.destroy()
+            self.load_orders()
+
+        def render_days() -> None:
+            for w in grid.winfo_children():
+                w.destroy()
+            title_lbl.configure(text=f"{calendar.month_name[month_var.get()]} {year_var.get()}")
+            for idx, name in enumerate(["Mo", "Tu", "We", "Th", "Fr", "Sa", "Su"]):
+                ctk.CTkLabel(grid, text=name, width=32, anchor="center").grid(row=0, column=idx, pady=(0, 6))
+            start_day, days_in_month = calendar.monthrange(year_var.get(), month_var.get())
+            row = 1
+            col = start_day
+            for day in range(1, days_in_month + 1):
+                btn = ctk.CTkButton(
+                    grid,
+                    text=str(day),
+                    width=32,
+                    height=28,
+                    command=lambda d=day: select_day(d),
+                )
+                btn.grid(row=row, column=col, padx=2, pady=2)
+                col += 1
+                if col > 6:
+                    col = 0
+                    row += 1
+
+        render_days()
+
     def clear_order_filters(self) -> None:
         self.status_filter.set("All")
         self.month_filter.set("All")
         self.date_from_var.set("")
         self.date_to_var.set("")
+        if hasattr(self, "date_from_entry"):
+            self.date_from_entry.delete(0, "end")
+        if hasattr(self, "date_to_entry"):
+            self.date_to_entry.delete(0, "end")
         self.order_search_var.set("")
         self.load_orders()
 
@@ -817,24 +952,32 @@ class RenusApp(ctk.CTk):
         order_code = db.ensure_row_code("orders", "order_code", "ORD-", oid)
         t = ctk.CTkToplevel(self)
         t.title(f"Order {order_code} Details")
-        t.geometry("420x680")
+        t.geometry("640x760")
         t.grab_set()
 
         ctk.CTkLabel(t, text=f"Order {order_code}\nID: {oid}", font=("Arial", 20, "bold")).pack(pady=6)
-        detail_frame = ctk.CTkScrollableFrame(t, fg_color="transparent", height=320)
-        detail_frame.pack(fill="both", expand=True, padx=10, pady=6)
+        detail_frame = ctk.CTkScrollableFrame(t, fg_color="transparent", height=420)
+        detail_frame.pack(fill="both", expand=True, padx=14, pady=10)
+        detail_frame.grid_columnconfigure(0, weight=1)
+        detail_frame.grid_columnconfigure(1, weight=1)
 
         items = db.fetch(
             "SELECT i.name, oi.quantity, oi.subtotal FROM order_items oi JOIN items i ON oi.item_id = i.id WHERE oi.order_id=?",
             (oid,),
         )
         total = 0
-        for name, qty, subtotal in items:
+        for idx, (name, qty, subtotal) in enumerate(items):
             total += subtotal
-            row = ctk.CTkFrame(detail_frame, fg_color=("gray95", "#333"))
-            row.pack(fill="x", pady=3)
-            ctk.CTkLabel(row, text=f"{name} x{qty}", anchor="w").pack(side="left", padx=8)
-            ctk.CTkLabel(row, text=currency(subtotal)).pack(side="right", padx=8)
+            card = ctk.CTkFrame(detail_frame, fg_color=("gray95", "#333"), corner_radius=8)
+            card.grid(row=idx // 2, column=idx % 2, padx=8, pady=6, sticky="nsew")
+            card.grid_columnconfigure(0, weight=1)
+            ctk.CTkLabel(card, text=name, anchor="w", wraplength=210, font=("Arial", 13, "bold")).grid(
+                row=0, column=0, sticky="w", padx=10, pady=(8, 2)
+            )
+            ctk.CTkLabel(card, text=f"Qty: {qty}", anchor="w").grid(row=1, column=0, sticky="w", padx=10, pady=2)
+            ctk.CTkLabel(card, text=currency(subtotal), anchor="e", font=("Arial", 12, "bold")).grid(
+                row=2, column=0, sticky="e", padx=10, pady=(2, 8)
+            )
 
         ctk.CTkLabel(t, text=f"Total: {currency(total)}", font=("Arial", 15, "bold")).pack(pady=6)
 
@@ -1015,7 +1158,7 @@ class RenusApp(ctk.CTk):
         c.drawString(40, 800, APP_NAME)
         c.setFont("Helvetica", 12)
         c.drawString(40, 780, APP_LOCATION)
-        c.drawString(40, 762, "Gourmet Durban curries & spices")
+        c.drawString(40, 762, APP_TAGLINE)
 
         c.setFillColor(colors.black)
         c.setFont("Helvetica-Bold", 14)
