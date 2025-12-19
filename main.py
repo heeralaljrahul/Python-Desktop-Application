@@ -2,6 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox
 import os
+import sys
 import shutil
 import random
 import re
@@ -27,12 +28,58 @@ from reportlab.lib.pagesizes import A4, letter
 from reportlab.lib.units import mm
 from reportlab.pdfgen import canvas
 
-# Configure logging
+
+# ==================== EXE/PYINSTALLER COMPATIBILITY ====================
+def get_resource_path(relative_path: str) -> str:
+    """Get absolute path to resource, works for dev and PyInstaller EXE"""
+    try:
+        # PyInstaller creates a temp folder and stores path in _MEIPASS
+        base_path = sys._MEIPASS
+    except AttributeError:
+        base_path = os.path.abspath(os.path.dirname(__file__))
+    return os.path.join(base_path, relative_path)
+
+
+def get_user_data_path(filename: str) -> str:
+    """Get path in user's data directory for writable files (database, logs)"""
+    if sys.platform == "win32":
+        base_dir = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "RenusDelights")
+    elif sys.platform == "darwin":
+        base_dir = os.path.join(os.path.expanduser("~"), "Library", "Application Support", "RenusDelights")
+    else:
+        base_dir = os.path.join(os.path.expanduser("~"), ".renusdelights")
+
+    os.makedirs(base_dir, exist_ok=True)
+    return os.path.join(base_dir, filename)
+
+
+def get_assets_path(filename: str) -> str:
+    """Get path for assets directory - uses resource path for bundled, local for dev"""
+    # First check if running from PyInstaller bundle
+    try:
+        base_path = sys._MEIPASS
+        return os.path.join(base_path, "assets", filename)
+    except AttributeError:
+        pass
+
+    # For development, use local assets folder
+    local_assets = os.path.join(os.path.dirname(__file__), "assets", filename)
+    if os.path.exists(local_assets):
+        return local_assets
+
+    # Fallback to user data path for runtime-created assets
+    user_assets = os.path.join(get_user_data_path("assets"), filename)
+    os.makedirs(os.path.dirname(user_assets), exist_ok=True)
+    return user_assets
+
+
+# ==================== LOGGING CONFIGURATION ====================
+LOG_FILE = get_user_data_path("renus_app.log")
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('renus_app.log'),
+        logging.FileHandler(LOG_FILE),
         logging.StreamHandler()
     ]
 )
@@ -301,13 +348,15 @@ def validate_phone(phone: str) -> bool:
 class DBManager:
     def __init__(self, db_name: str = "renus_system.db"):
         try:
-            self.conn = sqlite3.connect(db_name, check_same_thread=False)
+            # Use user data directory for database (writable location for EXE)
+            self.db_path = get_user_data_path(db_name)
+            self.conn = sqlite3.connect(self.db_path, check_same_thread=False)
             self.conn.row_factory = sqlite3.Row
             # Enable foreign key constraints
             self.conn.execute("PRAGMA foreign_keys = ON")
             self.cursor = self.conn.cursor()
             self.init_db()
-            logger.info(f"Database initialized: {db_name}")
+            logger.info(f"Database initialized: {self.db_path}")
         except sqlite3.Error as e:
             logger.error(f"Database connection error: {e}")
             raise
@@ -444,12 +493,13 @@ class DBManager:
         return code
 
     def seed_data(self) -> None:
-        if not os.path.exists("assets"):
-            os.makedirs("assets")
+        # Ensure assets directory exists in user data path
+        assets_dir = os.path.dirname(get_assets_path("placeholder.png"))
+        os.makedirs(assets_dir, exist_ok=True)
         self._create_placeholder_assets()
 
         if self.fetch("SELECT COUNT(*) FROM items")[0][0] == 0:
-            img_path = os.path.abspath("assets/placeholder.png")
+            img_path = get_assets_path("placeholder.png")
             items = [
                 ("Lamb Breyani", "Menu", 130.00),
                 ("Chicken Breyani", "Menu", 100.00),
@@ -555,18 +605,27 @@ class DBManager:
                 self.execute("UPDATE orders SET total=? WHERE id=?", (total, oid))
 
     def _create_placeholder_assets(self) -> None:
-        logo_path = "assets/logo.png"
+        logo_path = get_assets_path("logo.png")
         if not os.path.exists(logo_path):
-            img = Image.new("RGB", (120, 120), THEME_COLOR)
-            draw = ImageDraw.Draw(img)
-            draw.text((28, 40), "RA", fill="white")
-            img.save(logo_path)
-        ph_path = "assets/placeholder.png"
+            try:
+                img = Image.new("RGB", (120, 120), THEME_COLOR)
+                draw = ImageDraw.Draw(img)
+                draw.text((28, 40), "RA", fill="white")
+                img.save(logo_path)
+                logger.info(f"Created logo at: {logo_path}")
+            except Exception as e:
+                logger.error(f"Failed to create logo: {e}")
+
+        ph_path = get_assets_path("placeholder.png")
         if not os.path.exists(ph_path):
-            img = Image.new("RGB", (120, 120), "#4a4a4a")
-            draw = ImageDraw.Draw(img)
-            draw.text((28, 45), "SA", fill="white")
-            img.save(ph_path)
+            try:
+                img = Image.new("RGB", (120, 120), "#4a4a4a")
+                draw = ImageDraw.Draw(img)
+                draw.text((28, 45), "SA", fill="white")
+                img.save(ph_path)
+                logger.info(f"Created placeholder at: {ph_path}")
+            except Exception as e:
+                logger.error(f"Failed to create placeholder: {e}")
 
     def fetch(self, query: str, params: Tuple = ()) -> List[sqlite3.Row]:
         try:
@@ -687,9 +746,20 @@ class RenusApp(ctk.CTk):
         self.title(f"{APP_NAME} | Manager")
         self.geometry("1500x950")
         self.after(100, self._maximize_window)
-        self.logo_img = ctk.CTkImage(Image.open("assets/logo.png"), size=(44, 44))
+
+        # Load logo with fallback for EXE deployment
+        logo_path = get_assets_path("logo.png")
+        try:
+            self.logo_img = ctk.CTkImage(Image.open(logo_path), size=(44, 44))
+        except Exception as e:
+            logger.warning(f"Could not load logo from {logo_path}: {e}")
+            # Create a simple fallback logo
+            fallback = Image.new("RGB", (44, 44), Theme.PRIMARY)
+            self.logo_img = ctk.CTkImage(fallback, size=(44, 44))
+
         self.cart: Dict[int, Dict] = {}
         self.date_picker_win: Optional[ctk.CTkToplevel] = None
+        self._chart_figures: List[Figure] = []  # Track figures for cleanup
 
         self.grid_columnconfigure(1, weight=1)
         self.grid_rowconfigure(0, weight=1)
@@ -745,8 +815,20 @@ class RenusApp(ctk.CTk):
         switch.grid(row=11, column=0, pady=20)
 
     def clear_content(self) -> None:
+        # Close any matplotlib figures to prevent memory leaks
+        self._cleanup_charts()
         for widget in self.content.winfo_children():
             widget.destroy()
+
+    def _cleanup_charts(self) -> None:
+        """Close all tracked matplotlib figures to prevent memory leaks"""
+        if hasattr(self, "_chart_figures"):
+            for fig in self._chart_figures:
+                try:
+                    plt.close(fig)
+                except Exception:
+                    pass
+            self._chart_figures.clear()
 
     def add_header(self, title: str, subtitle: Optional[str] = None) -> None:
         head = ctk.CTkFrame(self.content, height=80, fg_color=("white", "#1f1f1f"))
@@ -977,6 +1059,24 @@ class RenusApp(ctk.CTk):
     def change_cart_qty(self, iid: int, delta: int) -> None:
         if iid not in self.cart:
             return
+
+        # Validate stock when increasing quantity
+        if delta > 0:
+            current_stock = db.get_item_stock(iid)
+            if current_stock is None:
+                messagebox.showerror("Error", "Item no longer exists.")
+                self.cart.pop(iid, None)
+                self.update_cart()
+                return
+
+            current_qty = self.cart[iid]["qty"]
+            if current_qty >= current_stock:
+                messagebox.showwarning(
+                    "Stock Limit",
+                    f"Cannot add more. Only {current_stock} available in stock."
+                )
+                return
+
         self.cart[iid]["qty"] += delta
         if self.cart[iid]["qty"] <= 0:
             self.cart.pop(iid, None)
@@ -2051,7 +2151,7 @@ class RenusApp(ctk.CTk):
         ctk.CTkLabel(img_frame, text="Image").pack(anchor="w")
         preview_label = ctk.CTkLabel(img_frame, text="No image", anchor="w")
         preview_label.pack(fill="x", pady=4)
-        selected_image_path = os.path.abspath("assets/placeholder.png")
+        selected_image_path = get_assets_path("placeholder.png")
 
         def set_preview(path: str) -> None:
             nonlocal selected_image_path
@@ -2060,7 +2160,8 @@ class RenusApp(ctk.CTk):
                 img = ctk.CTkImage(Image.open(path), size=(80, 80))
                 preview_label.configure(text="", image=img)
                 preview_label.image = img
-            except Exception:
+            except Exception as e:
+                logger.warning(f"Failed to preview image {path}: {e}")
                 preview_label.configure(text=os.path.basename(path), image=None)
 
         def upload_image() -> None:
@@ -2068,7 +2169,8 @@ class RenusApp(ctk.CTk):
             if not file_path:
                 return
             try:
-                dest_dir = "assets"
+                # Use user data assets directory for uploaded images
+                dest_dir = os.path.dirname(get_assets_path("uploads"))
                 os.makedirs(dest_dir, exist_ok=True)
                 dest_path = os.path.join(dest_dir, os.path.basename(file_path))
                 base, ext = os.path.splitext(dest_path)
@@ -2077,8 +2179,10 @@ class RenusApp(ctk.CTk):
                     dest_path = f"{base}_{counter}{ext}"
                     counter += 1
                 shutil.copyfile(file_path, dest_path)
-                set_preview(os.path.abspath(dest_path))
+                set_preview(dest_path)
+                logger.info(f"Image uploaded to: {dest_path}")
             except Exception as exc:
+                logger.error(f"Failed to upload image: {exc}")
                 messagebox.showerror("Image", f"Failed to add image: {exc}")
 
         ctk.CTkButton(img_frame, text="Upload Image", fg_color=THEME_COLOR, command=upload_image).pack(fill="x")
@@ -2109,7 +2213,7 @@ class RenusApp(ctk.CTk):
             if stock_val is None:
                 messagebox.showerror("Validation", "Enter a valid stock number")
                 return
-            path = selected_image_path or os.path.abspath("assets/placeholder.png")
+            path = selected_image_path or get_assets_path("placeholder.png")
             if iid:
                 db.execute(
                     "UPDATE items SET name=?, category=?, price=?, stock=?, image_path=? WHERE id=?",
@@ -2127,8 +2231,26 @@ class RenusApp(ctk.CTk):
         ctk.CTkButton(t, text="Save Item", command=save, fg_color=THEME_COLOR).pack(pady=20, fill="x", padx=20)
 
     def del_item(self, iid: int) -> None:
-        if messagebox.askyesno("Confirm", "Delete item?"):
+        # Check if item is used in any orders
+        order_refs = db.fetch(
+            "SELECT COUNT(*) FROM order_items WHERE item_id = ?", (iid,)
+        )[0][0]
+
+        if order_refs > 0:
+            if not messagebox.askyesno(
+                "Item In Use",
+                f"This item is referenced in {order_refs} order(s).\n\n"
+                "Deleting it will remove it from order history.\n"
+                "Are you sure you want to delete?"
+            ):
+                return
+            # Delete order_items references first
+            db.execute("DELETE FROM order_items WHERE item_id = ?", (iid,))
+            logger.info(f"Deleted {order_refs} order_items references for item {iid}")
+
+        if messagebox.askyesno("Confirm", "Delete item permanently?"):
             db.execute("DELETE FROM items WHERE id=?", (iid,))
+            logger.info(f"Deleted item {iid}")
             self.show_menu()
 
     # ---------- CUSTOMERS ----------
@@ -2139,11 +2261,11 @@ class RenusApp(ctk.CTk):
         main.pack(fill="both", expand=True, padx=20, pady=20)
         controls = ctk.CTkFrame(main, fg_color="transparent")
         controls.pack(fill="x", pady=(0, 10))
-        self.customer_search_var = ctk.StringVar()
+        self.customers_page_search_var = ctk.StringVar()
         search_entry = ctk.CTkEntry(
             controls,
             placeholder_text="Search by name, email, city or phone",
-            textvariable=self.customer_search_var,
+            textvariable=self.customers_page_search_var,
         )
         search_entry.pack(side="left", fill="x", expand=True, padx=6)
 
@@ -2171,7 +2293,7 @@ class RenusApp(ctk.CTk):
         for w in self.customer_list_frame.winfo_children():
             w.destroy()
 
-        keyword = (self.customer_search_var.get() if hasattr(self, "customer_search_var") else "").strip().lower()
+        keyword = (self.customers_page_search_var.get() if hasattr(self, "customers_page_search_var") else "").strip().lower()
 
         # SQL-based filtering for better performance
         query = "SELECT id, name, email, address, city, phone FROM customers WHERE 1=1"
@@ -2244,8 +2366,8 @@ class RenusApp(ctk.CTk):
             ).pack(side="right", padx=5)
 
     def clear_customer_filters(self) -> None:
-        if hasattr(self, "customer_search_var"):
-            self.customer_search_var.set("")
+        if hasattr(self, "customers_page_search_var"):
+            self.customers_page_search_var.set("")
         self.render_customer_cards()
 
     def cust_popup(self, cid: Optional[int]) -> None:
@@ -2355,8 +2477,22 @@ class RenusApp(ctk.CTk):
         ).pack(pady=20, fill="x", padx=20)
 
     def del_cust(self, cid: int) -> None:
-        if messagebox.askyesno("Confirm", "Delete customer?"):
+        # Check if customer has orders
+        order_count = db.fetch(
+            "SELECT COUNT(*) FROM orders WHERE customer_id = ?", (cid,)
+        )[0][0]
+
+        if order_count > 0:
+            messagebox.showerror(
+                "Cannot Delete",
+                f"This customer has {order_count} order(s) in the system.\n\n"
+                "Customers with order history cannot be deleted to maintain data integrity."
+            )
+            return
+
+        if messagebox.askyesno("Confirm", "Delete customer permanently?"):
             db.execute("DELETE FROM customers WHERE id=?", (cid,))
+            logger.info(f"Deleted customer {cid}")
             self.show_customers()
 
     # ---------- USERS ----------
@@ -2730,6 +2866,9 @@ class RenusApp(ctk.CTk):
         ax.axis('equal')
         fig.tight_layout()
 
+        # Track figure for cleanup
+        self._chart_figures.append(fig)
+
         # Embed in tkinter
         canvas_widget = FigureCanvasTkAgg(fig, master=chart_frame)
         canvas_widget.draw()
@@ -2774,6 +2913,9 @@ class RenusApp(ctk.CTk):
                    str(qty), va='center', color=text_color, fontsize=8)
 
         fig.tight_layout()
+
+        # Track figure for cleanup
+        self._chart_figures.append(fig)
 
         # Embed in tkinter
         canvas_widget = FigureCanvasTkAgg(fig, master=chart_frame)

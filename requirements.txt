@@ -1,0 +1,22 @@
+# RENUS AUTHENTIC DELIGHTS - Python Dependencies
+# Install with: pip install -r requirements.txt
+
+# GUI Framework
+customtkinter>=5.2.0
+
+# Image Processing
+Pillow>=10.0.0
+
+# PDF Generation
+reportlab>=4.0.0
+
+# Data Visualization
+matplotlib>=3.7.0
+
+# For building EXE (optional, only needed for deployment)
+pyinstaller>=6.0.0
+
+# Note: The following are part of Python standard library (no installation needed):
+# - tkinter (included with Python)
+# - sqlite3 (included with Python)
+# - os, sys, shutil, random, re, calendar, logging, io, datetime, typing, functools, weakref
